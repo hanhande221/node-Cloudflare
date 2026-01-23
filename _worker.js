@@ -1,423 +1,378 @@
-// ============================================
-// VLESS Cloudflare Workers 代理脚本
-// 每个订阅节点使用独立的 proxyIP
-// 访问 /UUID 进入订阅中心
-// ============================================
-
 import { connect } from 'cloudflare:sockets';
 
-// ============ 配置区域 ============
-let subPath = 'sub';
-let yourUUID = '757e052c-4159-491d-bc5d-1b6bd866d980';
-
-let cfip = [
-    '50.62.172.207:2096#LHR',
-    '50.62.173.32:2096#LHR',
-    '156.231.141.37:2087#NRT'
-];
-
-// ============ 工具函数 ============
-const closeSocket = (socket) => {
-    try {
-        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
-            socket.close();
-        }
-    } catch {}
-};
-
-const formatUUID = (arr, offset = 0) => {
-    const hex = [...arr.slice(offset, offset + 16)].map(b => b.toString(16).padStart(2, '0')).join('');
-    return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
-};
-
-const base64ToArray = (str) => {
-    if (!str) return { earlyData: null, error: null };
-    try {
-        const binary = atob(str.replace(/-/g, '+').replace(/_/g, '/'));
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-        return { earlyData: bytes.buffer, error: null };
-    } catch (error) {
-        return { earlyData: null, error };
-    }
-};
-
-// ============ 代理解析 ============
-const parseProxy = (str) => {
-    if (!str) return null;
-    str = str.trim();
-
-    // SOCKS5
-    if (str.startsWith('socks://') || str.startsWith('socks5://')) {
-        try {
-            const url = new URL(str.replace(/^socks:\/\//, 'socks5://'));
-            return {
-                type: 'socks5',
-                host: url.hostname,
-                port: parseInt(url.port) || 1080,
-                username: url.username ? decodeURIComponent(url.username) : '',
-                password: url.password ? decodeURIComponent(url.password) : ''
-            };
-        } catch { return null; }
-    }
-
-    // HTTP/HTTPS
-    if (str.startsWith('http://') || str.startsWith('https://')) {
-        try {
-            const url = new URL(str);
-            return {
-                type: 'http',
-                host: url.hostname,
-                port: parseInt(url.port) || (str.startsWith('https://') ? 443 : 80),
-                username: url.username ? decodeURIComponent(url.username) : '',
-                password: url.password ? decodeURIComponent(url.password) : ''
-            };
-        } catch { return null; }
-    }
-
-    // IPv6 [host]:port
-    if (str.startsWith('[')) {
-        const idx = str.indexOf(']:');
-        if (idx > 0) {
-            return { type: 'direct', host: str.slice(1, idx), port: parseInt(str.slice(idx + 2)) || 443 };
-        }
-        return { type: 'direct', host: str.slice(1, str.indexOf(']')), port: 443 };
-    }
-
-    // host:port
-    const idx = str.lastIndexOf(':');
-    if (idx > 0) {
-        const port = parseInt(str.slice(idx + 1));
-        if (port > 0 && port <= 65535) {
-            return { type: 'direct', host: str.slice(0, idx), port };
-        }
-    }
-
-    return { type: 'direct', host: str, port: 443 };
-};
-
-// ============ VLESS 处理 ============
-async function handleVLESS(request, customProxy) {
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-    server.accept();
-
-    let remoteSocket = null;
-    let isDNS = false;
-    const earlyData = request.headers.get('sec-websocket-protocol') || '';
-
-    makeReadable(server, earlyData).pipeTo(new WritableStream({
-        async write(chunk) {
-            if (isDNS) return forwardDNS(chunk, server, null);
-            
-            if (remoteSocket) {
-                const w = remoteSocket.writable.getWriter();
-                await w.write(chunk);
-                w.releaseLock();
-                return;
-            }
-
-            const parsed = parseVLESS(chunk, yourUUID);
-            if (parsed.error) throw new Error(parsed.error);
-
-            if (parsed.isUDP) {
-                if (parsed.port === 53) isDNS = true;
-                else throw new Error('Only DNS UDP supported');
-            }
-
-            const header = new Uint8Array([parsed.version[0], 0]);
-            const payload = chunk.slice(parsed.dataIndex);
-
-            if (isDNS) return forwardDNS(payload, server, header);
-
-            remoteSocket = await connectRemote(
-                parsed.hostname,
-                parsed.port,
-                payload,
-                server,
-                header,
-                customProxy
-            );
-        }
-    })).catch(err => console.error('Pipe error:', err.message));
-
-    return new Response(null, { status: 101, webSocket: client });
-}
-
-// ============ VLESS 解析 ============
-function parseVLESS(chunk, uuid) {
-    if (chunk.byteLength < 24) return { error: 'Invalid length' };
-
-    const view = new DataView(chunk);
-    const version = new Uint8Array(chunk.slice(0, 1));
-
-    if (formatUUID(new Uint8Array(chunk.slice(1, 17))) !== uuid) {
-        return { error: 'Invalid UUID' };
-    }
-
-    const optLen = view.getUint8(17);
-    const cmd = view.getUint8(18 + optLen);
-    const isUDP = cmd === 2;
-    
-    if (cmd !== 1 && cmd !== 2) return { error: 'Invalid command' };
-
-    let pos = 19 + optLen;
-    const port = view.getUint16(pos);
-    const addrType = view.getUint8(pos + 2);
-    pos += 3;
-
-    let hostname = '';
-    switch (addrType) {
-        case 1: // IPv4
-            hostname = `${view.getUint8(pos)}.${view.getUint8(pos+1)}.${view.getUint8(pos+2)}.${view.getUint8(pos+3)}`;
-            pos += 4;
-            break;
-        case 2: // Domain
-            const len = view.getUint8(pos++);
-            hostname = new TextDecoder().decode(chunk.slice(pos, pos + len));
-            pos += len;
-            break;
-        case 3: // IPv6
-            const parts = [];
-            for (let i = 0; i < 8; i++, pos += 2) {
-                parts.push(view.getUint16(pos).toString(16));
-            }
-            hostname = parts.join(':');
-            break;
-        default:
-            return { error: 'Invalid address type' };
-    }
-
-    return { error: null, hostname, port, isUDP, version, dataIndex: pos };
-}
-
-// ============ 远程连接 ============
-async function connectRemote(host, port, data, ws, header, customProxy) {
-    const directConnect = async () => {
-        const sock = connect({ hostname: host, port });
-        const w = sock.writable.getWriter();
-        await w.write(data);
-        w.releaseLock();
-        return sock;
-    };
-
-    let proxy = parseProxy(customProxy || proxyIP);
-    if (!proxy) proxy = { type: 'direct', host: proxyIP, port: 443 };
-
-    const viaProxy = async () => {
-        let sock;
-        if (proxy.type === 'socks5') {
-            sock = await connectSOCKS5(proxy, host, port, data);
-        } else if (proxy.type === 'http') {
-            sock = await connectHTTP(proxy, host, port, data);
-        } else {
-            sock = await directConnect();
-        }
-        
-        sock.closed.catch(() => {}).finally(() => closeSocket(ws));
-        pipeStreams(sock, ws, header);
-        return sock;
-    };
-
-    if (['socks5', 'http', 'https'].includes(proxy.type)) {
-        return await viaProxy();
-    }
-
-    try {
-        const sock = await directConnect();
-        pipeStreams(sock, ws, header);
-        return sock;
-    } catch (err) {
-        console.error('Direct failed, trying proxy:', err.message);
-        return await viaProxy();
-    }
-}
-
-// ============ HTTP 代理连接 ============
-async function connectHTTP(cfg, host, port, data) {
-    const sock = connect({ hostname: cfg.host, port: cfg.port });
-    const w = sock.writable.getWriter();
-    const r = sock.readable.getReader();
-
-    try {
-        let req = `CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n`;
-        if (cfg.username && cfg.password) {
-            req += `Proxy-Authorization: Basic ${btoa(cfg.username + ':' + cfg.password)}\r\n`;
-        }
-        req += '\r\n';
-
-        await w.write(new TextEncoder().encode(req));
-
-        let buf = new Uint8Array(0);
-        while (true) {
-            const { value, done } = await r.read();
-            if (done) throw new Error('Connection closed');
-            
-            const newBuf = new Uint8Array(buf.length + value.length);
-            newBuf.set(buf);
-            newBuf.set(value, buf.length);
-            buf = newBuf;
-
-            const str = new TextDecoder().decode(buf);
-            if (str.includes('\r\n\r\n')) {
-                const match = str.match(/HTTP\/\d\.\d\s+(\d+)/);
-                if (!match || parseInt(match[1]) >= 300) {
-                    throw new Error('Proxy failed');
-                }
-                break;
-            }
-            if (buf.length > 8192) throw new Error('Invalid response');
-        }
-
-        await w.write(data);
-        w.releaseLock();
-        r.releaseLock();
-        return sock;
-    } catch (err) {
-        try { w.releaseLock(); } catch {}
-        try { r.releaseLock(); } catch {}
-        throw err;
-    }
-}
-
-// ============ 流处理 ============
-function makeReadable(ws, early) {
-    let cancelled = false;
-    return new ReadableStream({
-        start(ctrl) {
-            ws.addEventListener('message', e => !cancelled && ctrl.enqueue(e.data));
-            ws.addEventListener('close', () => !cancelled && (closeSocket(ws), ctrl.close()));
-            ws.addEventListener('error', e => ctrl.error(e));
-
-            const { earlyData, error } = base64ToArray(early);
-            if (error) ctrl.error(error);
-            else if (earlyData) ctrl.enqueue(earlyData);
-        },
-        cancel() {
-            cancelled = true;
-            closeSocket(ws);
-        }
-    });
-}
-
-function pipeStreams(remote, ws, header) {
-    let hasHeader = !!header;
-    remote.readable.pipeTo(new WritableStream({
-        write(chunk) {
-            if (ws.readyState !== WebSocket.OPEN) return;
-            if (hasHeader) {
-                const res = new Uint8Array(header.length + chunk.byteLength);
-                res.set(header);
-                res.set(chunk, header.length);
-                ws.send(res.buffer);
-                hasHeader = false;
-            } else {
-                ws.send(chunk);
-            }
-        }
-    })).catch(() => closeSocket(ws));
-}
-
-// ============ DNS 转发 ============
-async function forwardDNS(data, ws, header) {
-    try {
-        const sock = connect({ hostname: '8.8.4.4', port: 53 });
-        const w = sock.writable.getWriter();
-        await w.write(data);
-        w.releaseLock();
-        
-        let hasHeader = !!header;
-        await sock.readable.pipeTo(new WritableStream({
-            write(chunk) {
-                if (ws.readyState === WebSocket.OPEN) {
-                    if (hasHeader) {
-                        const res = new Uint8Array(header.length + chunk.byteLength);
-                        res.set(header);
-                        res.set(chunk, header.length);
-                        ws.send(res.buffer);
-                        hasHeader = false;
-                    } else {
-                        ws.send(chunk);
-                    }
-                }
-            }
-        }));
-    } catch (err) {
-        console.error('DNS error:', err.message);
-    }
-}
-
-// ============ 页面生成 ============
-const simplePage = () => new Response(
-    `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VLESS</title><style>*{margin:0;padding:0}body{font-family:system-ui;background:linear-gradient(135deg,#667eea,#764ba2);height:100vh;display:flex;align-items:center;justify-content:center}.box{background:#fff;border-radius:20px;padding:40px;box-shadow:0 20px 40px rgba(0,0,0,.2);text-align:center;max-width:500px}.title{font-size:2rem;margin:20px 0;color:#333}.info{color:#666;font-size:1.1rem}.hl{color:#667eea;font-weight:700;background:#f0f0f0;padding:4px 8px;border-radius:4px}</style></head><body><div class="box"><h1 class="title">🚀 VLESS Service</h1><p class="info">访问 <span class="hl">/UUID</span> 进入订阅中心</p></div></body></html>`,
-    { headers: { 'Content-Type': 'text/html;charset=utf-8' } }
-);
-
-const homePage = (host, base) => new Response(
-    `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VLESS Manager</title><style>*{margin:0;padding:0}body{font-family:system-ui;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;padding:20px;display:flex;align-items:center;justify-content:center}.box{background:#fff;border-radius:20px;padding:30px;max-width:800px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.3)}.title{font-size:1.8rem;color:#333;margin-bottom:20px;text-align:center}.card{background:#f7f9fc;border-radius:12px;padding:20px;margin:20px 0;border-left:4px solid #667eea}.row{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #e0e0e0;gap:10px}.row:last-child{border:0}.label{font-weight:600;color:#555;flex-shrink:0}.val{color:#333;font-family:monospace;background:#e8eaf0;padding:4px 8px;border-radius:4px;font-size:.85rem;word-break:break-all;flex:1;text-align:right}.uuid{color:#667eea;font-weight:600}.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}.btn{flex:1;min-width:150px;padding:12px;border:0;border-radius:8px;background:linear-gradient(45deg,#667eea,#764ba2);color:#fff;font-weight:600;cursor:pointer;transition:.3s}.btn:hover{transform:translateY(-2px);box-shadow:0 10px 20px rgba(0,0,0,.2)}@media(max-width:768px){.row{flex-direction:column;gap:5px}.val{text-align:left}.btns{flex-direction:column}.btn{width:100%}}</style></head><body><div class="box"><h1 class="title">🚀 VLESS 管理面板</h1><div class="card"><div class="row"><span class="label">主机:</span><span class="val">${host}</span></div><div class="row"><span class="label">UUID:</span><span class="val uuid">${yourUUID}</span></div><div class="row"><span class="label">V2rayN:</span><span class="val">${base}/${subPath}</span></div><div class="row"><span class="label">Clash:</span><span class="val">https://sublink.eooce.com/clash?config=${base}/${subPath}</span></div><div class="row"><span class="label">Singbox:</span><span class="val">https://sublink.eooce.com/singbox?config=${base}/${subPath}</span></div></div><div class="btns"><button onclick="cp('${base}/${subPath}')" class="btn">复制 V2rayN</button><button onclick="cp('https://sublink.eooce.com/clash?config=${base}/${subPath}')" class="btn">复制 Clash</button><button onclick="cp('https://sublink.eooce.com/singbox?config=${base}/${subPath}')" class="btn">复制 Singbox</button></div></div><script>function cp(s){navigator.clipboard.writeText(s).then(()=>alert('✓ 已复制')).catch(()=>{let e=document.createElement('textarea');e.value=s;document.body.appendChild(e);e.select();document.execCommand('copy');document.body.removeChild(e);alert('✓ 已复制')})}</script></body></html>`,
-    { headers: { 'Content-Type': 'text/html;charset=utf-8' } }
-);
-
-// ============ 主函数 ============
 export default {
-    async fetch(request, env) {
-        try {
-            // 环境变量配置
-            if (env.PROXYIP || env.proxyip || env.proxyIP) {
-                proxyIP = (env.PROXYIP || env.proxyip || env.proxyIP).split(',')[0].trim();
-            }
-            subPath = env.SUB_PATH || env.subpath || subPath;
-            yourUUID = env.UUID || env.uuid || yourUUID;
+	async fetch(req, env) {
+		// ========== 配置区域 ==========
+		// UUID 配置（从环境变量读取，或使用默认值）
+		const UUID = env.UUID || '757e052c-4159-491d-bc5d-1b6bd866d980';
+		
+		// 优选 IP 列表（格式：IP:端口#地区标识）
+		// 这些 IP 可以用作 ProxyIP，也会出现在订阅中
+		const PREFERRED_IPS = [
+			'proxyip.us.cmliussss.net:443#US',
+			'proxyip.jp.cmliussss.net:443#JP',
+			'proxyip.hk.cmliussss.net:443#HK'
+			// 可以继续添加更多优选IP
+			// '1.2.3.4:443#HKG',
+			// '5.6.7.8:2096#SIN',
+		];
+		
+		// ========== 订阅生成处理 ==========
+		// 检查是否访问 /sub 路径，生成订阅内容
+		const url = new URL(req.url);
+		if (url.pathname === '/sub') {
+			return generateSubscription(req, UUID, PREFERRED_IPS);
+		}
 
-            const url = new URL(request.url);
-            const path = url.pathname;
-            const host = url.hostname;
+		// ========== WebSocket 连接处理 ==========
+		// 检查是否是 WebSocket 升级请求
+		if (req.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
+			// 创建 WebSocket 对
+			const [client, ws] = Object.values(new WebSocketPair());
+			ws.accept();
 
-            // WebSocket 升级
-            if (request.headers.get('Upgrade') === 'websocket') {
-                const customProxy = url.searchParams.get('proxyip') || 
-                                   (path.startsWith('/proxyip=') ? decodeURIComponent(path.slice(9)).trim() : null) ||
-                                   request.headers.get('proxyip');
-                return await handleVLESS(request, customProxy);
-            }
+			const u = new URL(req.url);
 
-            // HTTP 请求处理
-            if (path === '/') return simplePage();
-            
-            if (path.toLowerCase() === `/${yourUUID.toLowerCase()}`) {
-                return homePage(host, `https://${host}`);
-            }
+			// 修复处理 URL 编码的查询参数
+			// 处理类似 /path%3Fkey=value 这样的编码URL
+			if (u.pathname.includes('%3F')) {
+				const decoded = decodeURIComponent(u.pathname);
+				const queryIndex = decoded.indexOf('?');
+				if (queryIndex !== -1) {
+					u.search = decoded.substring(queryIndex);
+					u.pathname = decoded.substring(0, queryIndex);
+				}
+			}
 
-            // 订阅生成
-            if (path.toLowerCase().includes(`/${subPath.toLowerCase()}`)) {
-                const links = cfip.map(item => {
-                    const [addr, name] = item.includes('#') ? item.split('#') : [item, 'CF'];
-                    let h, p = 443;
-                    
-                    if (addr.startsWith('[') && addr.includes(']:')) {
-                        const i = addr.indexOf(']:');
-                        h = addr.slice(0, i + 1);
-                        p = parseInt(addr.slice(i + 2)) || 443;
-                    } else if (addr.includes(':')) {
-                        [h, p] = addr.split(':');
-                        p = parseInt(p) || 443;
-                    } else {
-                        h = addr;
-                    }
+			// ========== 解析连接参数 ==========
+			// mode: 连接模式（auto/direct/s5/proxy）
+			const mode = u.searchParams.get('mode') || 'auto';
+			// s5: SOCKS5 代理参数
+			const s5Param = u.searchParams.get('s5');
+			// proxyip: ProxyIP 参数（可以使用优选IP）
+			const proxyParam = u.searchParams.get('proxyip');
+			// 从路径或s5参数获取配置
+			const path = s5Param ? s5Param : u.pathname.slice(1);
 
-                    const nodeProxyIP = encodeURIComponent(addr);
-                    return `vless://${yourUUID}@${h}:${p}?encryption=none&security=tls&sni=${host}&fp=firefox&type=ws&host=${host}&path=%2F%3Fed%3D2560%26proxyip%3D${nodeProxyIP}#${name}`;
-                });
+			// ========== 解析 SOCKS5 配置 ==========
+			// 格式：username:password@host:port
+			const socks5 = path.includes('@') ? (() => {
+				const [cred, server] = path.split('@');
+				const [user, pass] = cred.split(':');
+				const [host, port = 443] = server.split(':');
+				return {
+					user,
+					pass,
+					host,
+					port: +port
+				};
+			})() : null;
 
-                return new Response(btoa(unescape(encodeURIComponent(links.join('\n')))), {
-                    headers: { 'Content-Type': 'text/plain; charset=utf-8' }
-                });
-            }
+			// ========== 解析 ProxyIP 配置 ==========
+			// ProxyIP 可以是普通IP或优选IP
+			const PROXY_IP = proxyParam ? String(proxyParam) : null;
 
-            return new Response('Not Found', { status: 404 });
-        } catch (err) {
-            console.error('Error:', err);
-            return new Response('Internal Error', { status: 500 });
-        }
-    }
+			// ========== 确定连接顺序 ==========
+			// auto 模式：按 URL 参数顺序尝试连接
+			// proxy 模式：先 direct 后 proxy
+			// 其他模式：单一模式
+			const getOrder = () => {
+				if (mode === 'proxy') return ['direct', 'proxy'];
+				if (mode !== 'auto') return [mode];
+				
+				const order = [];
+				const searchStr = u.search.slice(1);
+				// 按参数出现顺序添加连接方式
+				for (const pair of searchStr.split('&')) {
+					const key = pair.split('=')[0];
+					if (key === 'direct') order.push('direct');
+					else if (key === 's5') order.push('s5');
+					else if (key === 'proxyip') order.push('proxy');
+				}
+				// 没有参数时默认 direct
+				return order.length ? order : ['direct'];
+			};
+
+			// ========== 连接状态变量 ==========
+			let remote = null;      // 远程连接对象
+			let udpWriter = null;   // UDP 写入器（用于DNS）
+			let isDNS = false;      // 是否是 DNS 请求
+
+			// ========== SOCKS5 连接函数 ==========
+			const socks5Connect = async (targetHost, targetPort) => {
+				// 连接到 SOCKS5 服务器
+				const sock = connect({
+					hostname: socks5.host,
+					port: socks5.port
+				});
+				await sock.opened;
+
+				const w = sock.writable.getWriter();
+				const r = sock.readable.getReader();
+
+				// 发送认证方法（支持无认证和用户名密码）
+				await w.write(new Uint8Array([5, 2, 0, 2]));
+				const auth = (await r.read()).value;
+
+				// 如果需要用户名密码认证
+				if (auth[1] === 2 && socks5.user) {
+					const user = new TextEncoder().encode(socks5.user);
+					const pass = new TextEncoder().encode(socks5.pass);
+					await w.write(new Uint8Array([1, user.length, ...user, pass.length, ...pass]));
+					await r.read();
+				}
+
+				// 发送连接请求（域名类型）
+				const domain = new TextEncoder().encode(targetHost);
+				await w.write(new Uint8Array([
+					5, 1, 0, 3, domain.length, ...domain,
+					targetPort >> 8, targetPort & 0xff
+				]));
+				await r.read();
+
+				w.releaseLock();
+				r.releaseLock();
+				return sock;
+			};
+
+			// ========== WebSocket 数据流处理 ==========
+			// 创建可读流，接收 WebSocket 消息
+			new ReadableStream({
+				start(ctrl) {
+					// 监听 WebSocket 消息
+					ws.addEventListener('message', e => ctrl.enqueue(e.data));
+					// 监听 WebSocket 关闭
+					ws.addEventListener('close', () => {
+						remote?.close();
+						ctrl.close();
+					});
+					// 监听 WebSocket 错误
+					ws.addEventListener('error', () => {
+						remote?.close();
+						ctrl.error();
+					});
+
+					// 处理早期数据（通过 sec-websocket-protocol 头传递）
+					const early = req.headers.get('sec-websocket-protocol');
+					if (early) {
+						try {
+							ctrl.enqueue(Uint8Array.from(
+								atob(early.replace(/-/g, '+').replace(/_/g, '/')),
+								c => c.charCodeAt(0)
+							).buffer);
+						} catch {}
+					}
+				}
+			}).pipeTo(new WritableStream({
+				async write(data) {
+					// ========== DNS 请求处理 ==========
+					if (isDNS) return udpWriter?.write(data);
+
+					// ========== 已建立连接的数据转发 ==========
+					if (remote) {
+						const w = remote.writable.getWriter();
+						await w.write(data);
+						w.releaseLock();
+						return;
+					}
+
+					// ========== 新连接建立 ==========
+					// 检查数据长度
+					if (data.byteLength < 24) return;
+
+					// UUID 验证（确保请求来自授权客户端）
+					const uuidBytes = new Uint8Array(data.slice(1, 17));
+					const expectedUUID = UUID.replace(/-/g, '');
+					for (let i = 0; i < 16; i++) {
+						if (uuidBytes[i] !== parseInt(expectedUUID.substr(i * 2, 2), 16)) return;
+					}
+
+					// ========== 解析 VLESS 协议头 ==========
+					const view = new DataView(data);
+					const optLen = view.getUint8(17);           // 附加选项长度
+					const cmd = view.getUint8(18 + optLen);     // 命令类型（1=TCP, 2=UDP）
+					if (cmd !== 1 && cmd !== 2) return;
+
+					// 解析目标地址和端口
+					let pos = 19 + optLen;
+					const port = view.getUint16(pos);           // 目标端口
+					const type = view.getUint8(pos + 2);        // 地址类型（1=IPv4, 2=域名, 3=IPv6）
+					pos += 3;
+
+					let addr = '';
+					if (type === 1) {
+						// IPv4 地址
+						addr = `${view.getUint8(pos)}.${view.getUint8(pos + 1)}.${view.getUint8(pos + 2)}.${view.getUint8(pos + 3)}`;
+						pos += 4;
+					} else if (type === 2) {
+						// 域名
+						const len = view.getUint8(pos++);
+						addr = new TextDecoder().decode(data.slice(pos, pos + len));
+						pos += len;
+					} else if (type === 3) {
+						// IPv6 地址
+						const ipv6 = [];
+						for (let i = 0; i < 8; i++, pos += 2) {
+							ipv6.push(view.getUint16(pos).toString(16));
+						}
+						addr = ipv6.join(':');
+					} else return;
+
+					// 构造响应头和负载数据
+					const header = new Uint8Array([data[0], 0]);
+					const payload = data.slice(pos);
+
+					// ========== UDP DNS 请求处理 ==========
+					if (cmd === 2) {
+						// 只处理 DNS 请求（端口 53）
+						if (port !== 53) return;
+						isDNS = true;
+						let sent = false;
+
+						// 创建转换流处理 DNS 消息
+						const { readable, writable } = new TransformStream({
+							transform(chunk, ctrl) {
+								// 解析 DNS 消息（前2字节是长度）
+								for (let i = 0; i < chunk.byteLength;) {
+									const len = new DataView(chunk.slice(i, i + 2)).getUint16(0);
+									ctrl.enqueue(chunk.slice(i + 2, i + 2 + len));
+									i += 2 + len;
+								}
+							}
+						});
+
+						// 使用 Cloudflare DoH 处理 DNS 查询
+						readable.pipeTo(new WritableStream({
+							async write(query) {
+								try {
+									const resp = await fetch('https://1.1.1.1/dns-query', {
+										method: 'POST',
+										headers: { 'content-type': 'application/dns-message' },
+										body: query
+									});
+									if (ws.readyState === 1) {
+										const result = new Uint8Array(await resp.arrayBuffer());
+										ws.send(new Uint8Array([
+											...(sent ? [] : header),
+											result.length >> 8,
+											result.length & 0xff,
+											...result
+										]));
+										sent = true;
+									}
+								} catch {}
+							}
+						}));
+
+						udpWriter = writable.getWriter();
+						return udpWriter.write(payload);
+					}
+
+					// ========== TCP 连接建立 ==========
+					let sock = null;
+					// 按顺序尝试不同的连接方式
+					for (const method of getOrder()) {
+						try {
+							if (method === 'direct') {
+								// 直连模式
+								sock = connect({ hostname: addr, port });
+								await sock.opened;
+								break;
+							} else if (method === 's5' && socks5) {
+								// SOCKS5 代理模式
+								sock = await socks5Connect(addr, port);
+								break;
+							} else if (method === 'proxy' && PROXY_IP) {
+								// ProxyIP 模式（使用优选IP或自定义IP）
+								const [ph, pp = port] = PROXY_IP.split(':');
+								sock = connect({
+									hostname: ph,
+									port: +pp || port
+								});
+								await sock.opened;
+								break;
+							}
+						} catch {}
+					}
+
+					// 如果所有方式都失败，放弃连接
+					if (!sock) return;
+
+					// 保存远程连接
+					remote = sock;
+
+					// 发送初始负载数据
+					const w = sock.writable.getWriter();
+					await w.write(payload);
+					w.releaseLock();
+
+					// ========== 数据转发（远程 -> WebSocket）==========
+					let sent = false;
+					sock.readable.pipeTo(new WritableStream({
+						write(chunk) {
+							if (ws.readyState === 1) {
+								// 第一个包需要加上响应头
+								ws.send(sent ? chunk : new Uint8Array([...header, ...new Uint8Array(chunk)]));
+								sent = true;
+							}
+						},
+						close: () => ws.readyState === 1 && ws.close(),
+						abort: () => ws.readyState === 1 && ws.close()
+					})).catch(() => {});
+				}
+			})).catch(() => {});
+
+			// 返回 WebSocket 响应
+			return new Response(null, {
+				status: 101,
+				webSocket: client
+			});
+		}
+
+		// ========== 默认请求处理 ==========
+		// 非 WebSocket 请求转发到示例站点
+		url.hostname = 'example.com';
+		return fetch(new Request(url, req));
+	}
 };
+
+// ========== 订阅生成函数 ==========
+function generateSubscription(req, uuid, preferredIPs) {
+	const url = new URL(req.url);
+	const host = url.hostname;
+	
+	// 生成订阅节点列表
+	const nodes = [];
+	
+	// 为每个优选IP生成节点配置
+	preferredIPs.forEach(ipConfig => {
+		const [ipPort, remark] = ipConfig.split('#');
+		const [ip, port] = ipPort.split(':');
+		
+		// 生成 VLESS 链接
+		// 格式：vless://UUID@IP:PORT?参数#备注
+		const vlessLink = `vless://${uuid}@${ip}:${port}?` +
+			`encryption=none` +
+			`&security=tls` +
+			`&sni=${host}` +
+			`&type=ws` +
+			`&host=${host}` +
+			`&path=${encodeURIComponent('/?mode=auto&direct&proxyip=' + ipPort)}` +
+			`#${encodeURIComponent(remark || ip)}`;
+		
+		nodes.push(vlessLink);
+	});
+	
+	// 将订阅内容编码为 Base64
+	const subscriptionContent = nodes.join('\n');
+	const base64Content = btoa(subscriptionContent);
+	
+	// 返回订阅内容
+	return new Response(base64Content, {
+		headers: {
+			'Content-Type': 'text/plain;charset=utf-8',
+			'Profile-Update-Interval': '24',
+			'Subscription-Userinfo': `upload=0; download=0; total=10737418240; expire=0`,
+		}
+	});
+}
