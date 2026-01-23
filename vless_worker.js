@@ -2,20 +2,15 @@
 // SUB_PATH | subpath  订阅路径
 // PROXYIP  | proxyip  代理IP
 // UUID     | uuid     UUID
-// DISABLE_TROJAN | 是否关闭Trojan, 设置为true时关闭，false开启，默认开启 
 
 import { connect } from 'cloudflare:sockets';
 
 let subPath = 'sub';     // 节点订阅路径,不修改将使用uuid作为订阅路径
-let password = 'Hanhan@2020';  // 主页密码,建议修改或添加 PASSWORD环境变量
 let proxyIP = 'proxyip.us.cmliussss.net:443';  // proxyIP 格式：ip、域名、ip:port、域名:port等,没填写port，默认使用443
 let yourUUID = '757e052c-4159-491d-bc5d-1b6bd866d980'; // UUID,建议修改或添加环境便量
-let disabletro = true;  // 是否关闭trojan, 设置为true时关闭，false开启 
 
 // CDN 
-let cfip = [ // 格式:优选域名:端口#备注名称、优选IP:端口#备注名称、[ipv6优选]:端口#备注名称、优选域名#备注 
-'172.64.34.59:443#多选', '172.64.156.99:443#移动','172.67.71.114:443#联通','108.162.198.119:443#电信'
-];  // 在此感谢各位大佬维护的优选域名
+let cfip = [ '172.64.34.59:443#多选', '172.64.156.99:443#移动','172.67.71.114:443#联通','108.162.198.119:443#电信'];  // 在此感谢各位大佬维护的优选域名
 
 function closeSocketQuietly(socket) { 
     try { 
@@ -125,82 +120,24 @@ function isSpeedTestSite(hostname) {
     return false;
 }
 
-async function sha224(text) {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(text);
-  const K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
-  let H = [0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939,0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4];
-  const msgLen = data.length;
-  const bitLen = msgLen * 8;
-  const paddedLen = Math.ceil((msgLen + 9) / 64) * 64;
-  const padded = new Uint8Array(paddedLen);
-  padded.set(data);
-  padded[msgLen] = 0x80;
-  const view = new DataView(padded.buffer);
-  view.setUint32(paddedLen - 4, bitLen, false);
-  for (let chunk = 0; chunk < paddedLen; chunk += 64) {
-    const W = new Uint32Array(64);
+function getSimplePage(request) {
+    const url = request.headers.get('Host');
+    const baseUrl = `https://${url}`;
+    const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>VLESS 服务</title><style>*{margin:0;padding:0;box-sizing:border-box;}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#7dd3ca 0%,#a17ec4 100%);height:100vh;display:flex;align-items:center;justify-content:center;color:#333;margin:0;padding:0;overflow:hidden;}.container{background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);border-radius:20px;padding:40px;box-shadow:0 20px 40px rgba(0,0,0,0.1);max-width:800px;width:95%;text-align:center;}.logo{margin-bottom:-20px;}.title{font-size:2rem;margin-bottom:30px;color:#2d3748;}.tip-content{color:#856404;font-size:1.2rem;line-height:1.6;}.highlight{font-weight:bold;color:#000;background:#fff;padding:2px 6px;border-radius:4px;font-family:monospace;}@media (max-width:768px){.container{padding:20px;}}</style></head><body><div class="container"><div class="logo"><img src="https://img.icons8.com/color/96/cloudflare.png" alt="Logo" width="96" height="96"></div><h1 class="title">Hello VLESS！</h1><div class="tip-content">访问 <span class="highlight">${baseUrl}/你的UUID</span> 进入订阅中心</div></div></div></body></html>`;
     
-    for (let i = 0; i < 16; i++) {
-      W[i] = view.getUint32(chunk + i * 4, false);
-    }
-    
-    for (let i = 16; i < 64; i++) {
-      const s0 = rightRotate(W[i - 15], 7) ^ rightRotate(W[i - 15], 18) ^ (W[i - 15] >>> 3);
-      const s1 = rightRotate(W[i - 2], 17) ^ rightRotate(W[i - 2], 19) ^ (W[i - 2] >>> 10);
-      W[i] = (W[i - 16] + s0 + W[i - 7] + s1) >>> 0;
-    }
-    
-    let [a, b, c, d, e, f, g, h] = H;
-    
-    for (let i = 0; i < 64; i++) {
-      const S1 = rightRotate(e, 6) ^ rightRotate(e, 11) ^ rightRotate(e, 25);
-      const ch = (e & f) ^ (~e & g);
-      const temp1 = (h + S1 + ch + K[i] + W[i]) >>> 0;
-      const S0 = rightRotate(a, 2) ^ rightRotate(a, 13) ^ rightRotate(a, 22);
-      const maj = (a & b) ^ (a & c) ^ (b & c);
-      const temp2 = (S0 + maj) >>> 0;
-      
-      h = g;
-      g = f;
-      f = e;
-      e = (d + temp1) >>> 0;
-      d = c;
-      c = b;
-      b = a;
-      a = (temp1 + temp2) >>> 0;
-    }
-    
-    H[0] = (H[0] + a) >>> 0;
-    H[1] = (H[1] + b) >>> 0;
-    H[2] = (H[2] + c) >>> 0;
-    H[3] = (H[3] + d) >>> 0;
-    H[4] = (H[4] + e) >>> 0;
-    H[5] = (H[5] + f) >>> 0;
-    H[6] = (H[6] + g) >>> 0;
-    H[7] = (H[7] + h) >>> 0;
-  }
-  
-  const result = [];
-  for (let i = 0; i < 7; i++) {
-    result.push(
-      ((H[i] >>> 24) & 0xff).toString(16).padStart(2, '0'),
-      ((H[i] >>> 16) & 0xff).toString(16).padStart(2, '0'),
-      ((H[i] >>> 8) & 0xff).toString(16).padStart(2, '0'),
-      (H[i] & 0xff).toString(16).padStart(2, '0')
-    );
-  }
-  return result.join('');
-}
-
-function rightRotate(value, amount) {
-  return (value >>> amount) | (value << (32 - amount));
+    return new Response(html, {
+        status: 200,
+        headers: {
+            'Content-Type': 'text/html;charset=utf-8',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+        },
+    });
 }
 
 export default {
 	/**
 	 * @param {import("@cloudflare/workers-types").Request} request
-	 * @param {{UUID: string, uuid: string, PROXYIP: string, PASSWORD: string, PASSWD: string, password: string, proxyip: string, proxyIP: string, SUB_PATH: string, subpath: string, DISABLE_TROJAN: string, CLOSE_TROJAN: string}} env
+	 * @param {{UUID: string, uuid: string, PROXYIP: string, PASSWORD: string, PASSWD: string, password: string, proxyip: string, proxyIP: string, SUB_PATH: string, subpath: string}} env
 	 * @param {import("@cloudflare/workers-types").ExecutionContext} ctx
 	 * @returns {Promise<Response>}
 	 */
@@ -215,10 +152,8 @@ export default {
                 const servers = (env.PROXYIP || env.proxyip || env.proxyIP).split(',').map(s => s.trim());
                 proxyIP = servers[0]; 
             }
-            password = env.PASSWORD || env.PASSWD || env.password || password;
             subPath = env.SUB_PATH || env.subpath || subPath;
             yourUUID = env.UUID || env.uuid || yourUUID;
-            disabletro = env.DISABLE_TROJAN || env.CLOSE_TROJAN || disabletro;
             
             const url = new URL(request.url);
             const pathname = url.pathname;
@@ -256,15 +191,18 @@ export default {
                 return await handleVlsRequest(request, customProxyIP);
             } else if (request.method === 'GET') {
                 if (url.pathname === '/') {
+                    return getSimplePage(request);
+                }
+                
+                if (url.pathname.toLowerCase() === `/${yourUUID.toLowerCase()}`) {
                     return getHomePage(request);
                 }
                 
                 if (url.pathname.toLowerCase().includes(`/${subPath.toLowerCase()}`)) {
                     const currentDomain = url.hostname;
                     const vlsHeader = 'v' + 'l' + 'e' + 's' + 's';
-                    const troHeader = 't' + 'r' + 'o' + 'j' + 'a' + 'n';
                     
-                    // 生成 VLE-SS 节点
+                    // 生成 VLESS 节点
                     const vlsLinks = cfip.map(cdnItem => {
                         let host, port = 443, nodeName = '';
                         if (cdnItem.includes('#')) {
@@ -290,36 +228,7 @@ export default {
                         return `${vlsHeader}://${yourUUID}@${host}:${port}?encryption=none&security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=1&type=ws&host=${currentDomain}&path=%2F%3Fed%3D2560#${vlsNodeName}`;
                     });
                     
-                    // 生成 Tro-jan 节点
-                    let allLinks = [...vlsLinks];
-                    if (!disabletro) {
-                        const troLinks = cfip.map(cdnItem => {
-                            let host, port = 443, nodeName = '';
-                            if (cdnItem.includes('#')) {
-                                const parts = cdnItem.split('#');
-                                cdnItem = parts[0];
-                                nodeName = parts[1];
-                            }
-
-                            if (cdnItem.startsWith('[') && cdnItem.includes(']:')) {
-                                const ipv6End = cdnItem.indexOf(']:');
-                                host = cdnItem.substring(0, ipv6End + 1); 
-                                const portStr = cdnItem.substring(ipv6End + 2); 
-                                port = parseInt(portStr) || 443;
-                            } else if (cdnItem.includes(':')) {
-                                const parts = cdnItem.split(':');
-                                host = parts[0];
-                                port = parseInt(parts[1]) || 443;
-                            } else {
-                                host = cdnItem;
-                            }
-                            
-                            const troNodeName = nodeName ? `${nodeName}` : `Workers`;
-                            return `${troHeader}://${yourUUID}@${host}:${port}?security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=1&type=ws&host=${currentDomain}&path=%2F%3Fed%3D2560#${troNodeName}`;
-                        });
-                        allLinks = [...vlsLinks, ...troLinks];
-                    }
-                    const linksText = allLinks.join('\n');
+                    const linksText = vlsLinks.join('\n');
                     const base64Content = btoa(unescape(encodeURIComponent(linksText)));
                     return new Response(base64Content, {
                         headers: { 
@@ -346,7 +255,6 @@ async function handleVlsRequest(request, customProxyIP) {
     serverSock.accept();
     let remoteConnWrapper = { socket: null };
     let isDnsQuery = false;
-    let isTrojan = false;
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
     const readable = makeReadableStr(serverSock, earlyData);
 
@@ -358,21 +266,6 @@ async function handleVlsRequest(request, customProxyIP) {
                 await writer.write(chunk);
                 writer.releaseLock();
                 return;
-            }
-            
-            if (!disabletro) {
-                const trojanResult = await parsetroHeader(chunk, yourUUID);
-                if (!trojanResult.hasError) {
-                    isTrojan = true;
-                    const { addressType, port, hostname, rawClientData } = trojanResult;
-                    
-                    if (isSpeedTestSite(hostname)) {
-                        throw new Error('Speedtest site is blocked');
-                    }
-                    
-                    await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, customProxyIP);
-                    return;
-                }
             }
             
             const { hasError, message, addressType, port, hostname, rawIndex, version, isUDP } = parseVLsPacketHeader(chunk, yourUUID);
@@ -396,76 +289,6 @@ async function handleVlsRequest(request, customProxyIP) {
     });
 
     return new Response(null, { status: 101, webSocket: clientSock });
-}
-
-async function parsetroHeader(buffer, passwordPlainText) {
-  const sha224Password = await sha224(passwordPlainText);
-  
-  if (buffer.byteLength < 56) {
-    return { hasError: true, message: "invalid data" };
-  }
-  let crLfIndex = 56;
-  if (new Uint8Array(buffer.slice(56, 57))[0] !== 0x0d || new Uint8Array(buffer.slice(57, 58))[0] !== 0x0a) {
-    return { hasError: true, message: "invalid header format" };
-  }
-  const password = new TextDecoder().decode(buffer.slice(0, crLfIndex));
-  if (password !== sha224Password) {
-    return { hasError: true, message: "invalid password" };
-  }
-
-  const socks5DataBuffer = buffer.slice(crLfIndex + 2);
-  if (socks5DataBuffer.byteLength < 6) {
-    return { hasError: true, message: "invalid S5 request data" };
-  }
-
-  const view = new DataView(socks5DataBuffer);
-  const cmd = view.getUint8(0);
-  if (cmd !== 1) {
-    return { hasError: true, message: "unsupported command, only TCP is allowed" };
-  }
-
-  const atype = view.getUint8(1);
-  let addressLength = 0;
-  let addressIndex = 2;
-  let address = "";
-  switch (atype) {
-    case 1: // IPv4
-      addressLength = 4;
-      address = new Uint8Array(socks5DataBuffer.slice(addressIndex, addressIndex + addressLength)).join(".");
-      break;
-    case 3: // Domain
-      addressLength = new Uint8Array(socks5DataBuffer.slice(addressIndex, addressIndex + 1))[0];
-      addressIndex += 1;
-      address = new TextDecoder().decode(socks5DataBuffer.slice(addressIndex, addressIndex + addressLength));
-      break;
-    case 4: // IPv6
-      addressLength = 16;
-      const dataView = new DataView(socks5DataBuffer.slice(addressIndex, addressIndex + addressLength));
-      const ipv6 = [];
-      for (let i = 0; i < 8; i++) {
-        ipv6.push(dataView.getUint16(i * 2).toString(16));
-      }
-      address = ipv6.join(":");
-      break;
-    default:
-      return { hasError: true, message: `invalid addressType is ${atype}` };
-  }
-
-  if (!address) {
-    return { hasError: true, message: `address is empty, addressType is ${atype}` };
-  }
-
-  const portIndex = addressIndex + addressLength;
-  const portBuffer = socks5DataBuffer.slice(portIndex, portIndex + 2);
-  const portRemote = new DataView(portBuffer).getUint16(0);
-
-  return {
-    hasError: false,
-    addressType: atype,
-    port: portRemote,
-    hostname: address,
-    rawClientData: socks5DataBuffer.slice(portIndex + 4)
-  };
 }
 
 async function connect2Socks5(proxyConfig, targetHost, targetPort, initialData) {
@@ -592,8 +415,6 @@ async function connect2Http(proxyConfig, targetHost, targetPort, initialData) {
         if (statusCode < 200 || statusCode >= 300) {
             throw new Error(`Connection failed: ${statusLine}`);
         }
-        
-        console.log('HTTP connection established for Trojan');
         
         await writer.write(initialData);
         writer.releaseLock();
@@ -786,222 +607,12 @@ async function forwardataudp(udpChunk, webSocket, respHeader) {
     }
 }
 
-/**
- * @param {import("@cloudflare/workers-types").Request} request
- * @returns {Response}
- */
 function getHomePage(request) {
 	const url = request.headers.get('Host');
 	const baseUrl = `https://${url}`;
-	const urlObj = new URL(request.url);
-	const providedPassword = urlObj.searchParams.get('password');
-	if (providedPassword) {
-		if (providedPassword === password) {
-			return getMainPageContent(url, baseUrl);
-		} else {
-			return getLoginPage(url, baseUrl, true);
-		}
-	}
-	return getLoginPage(url, baseUrl, false);
+	return getMainPageContent(url, baseUrl);
 }
 
-/**
- * 获取登录页面
- * @param {string} url 
- * @param {string} baseUrl 
- * @param {boolean} showError 
- * @returns {Response}
- */
-function getLoginPage(url, baseUrl, showError = false) {
-	const html = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Workers Service - 登录</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #7dd3ca 0%, #a17ec4 100%);
-            height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: #333;
-            margin: 0;
-            padding: 0;
-            overflow: hidden;
-        }
-        
-        .login-container {
-            background: rgba(255, 255, 255, 0.95);
-            backdrop-filter: blur(10px);
-            border-radius: 20px;
-            padding: 40px;
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
-            max-width: 400px;
-            width: 95%;
-            text-align: center;
-        }
-        
-        .logo {
-            margin-bottom: -20px;
-            background: linear-gradient(135deg, #7dd3ca 0%, #a17ec4 100%)
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-        
-        .title {
-            font-size: 1.8rem;
-            margin-bottom: 8px;
-            color: #2d3748;
-        }
-        
-        .subtitle {
-            color: #718096;
-            margin-bottom: 30px;
-            font-size: 1rem;
-        }
-        
-        .form-group {
-            margin-bottom: 20px;
-            text-align: left;
-        }
-        
-        .form-label {
-            display: block;
-            margin-bottom: 8px;
-            font-weight: 600;
-            color: #4a5568;
-        }
-        
-        .form-input {
-            width: 100%;
-            padding: 12px 16px;
-            border: 2px solid #e2e8f0;
-            border-radius: 8px;
-            font-size: 1rem;
-            transition: border-color 0.3s ease;
-            background: #fff;
-        }
-        
-        .form-input:focus {
-            outline: none;
-            border-color: #667eea;
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-        }
-        
-        .btn-login {
-            width: 100%;
-            padding: 12px 20px;
-            background: linear-gradient(135deg, #12cd9e 0%, #a881d0 100%);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-size: 1rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-        
-        .btn-login:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
-        }
-        
-        .error-message {
-            background: #fed7d7;
-            color: #c53030;
-            padding: 12px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            border-left: 4px solid #e53e3e;
-        }
-        
-        .footer {
-            margin-top: 20px;
-            color: #718096;
-            font-size: 0.9rem;
-        }
-        
-        @media (max-width: 480px) {
-            .login-container {
-                padding: 30px 20px;
-                margin: 10px;
-            }
-            
-            .logo {
-                font-size: 2.5rem;
-            }
-            
-            .title {
-                font-size: 1.5rem;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="login-container">
-        <div class="logo"><img src="https://img.icons8.com/color/96/cloudflare.png" alt="Logo"></div>
-        <h1 class="title">Workers Service</h1>
-        <p class="subtitle">请输入密码以访问服务</p>
-        
-        ${showError ? '<div class="error-message">密码错误,请重试</div>' : ''}
-        
-        <form onsubmit="handleLogin(event)">
-            <div class="form-group">
-                <input 
-                    type="password" 
-                    id="password" 
-                    name="password" 
-                    class="form-input" 
-                    placeholder="请输入密码"
-                    required
-                    autofocus
-                >
-            </div>
-            <button type="submit" class="btn-login">登录</button>
-        </form>
-        
-        <div class="footer">
-            <p>Powered by eooce <a href="https://t.me/eooceu" target="_blank" style="color: #007bff; text-decoration: none;">Join Telegram group</a></p>
-        </div>
-    </div>
-    
-    <script>
-        function handleLogin(event) {
-            event.preventDefault();
-            const password = document.getElementById('password').value;
-            const currentUrl = new URL(window.location);
-            currentUrl.searchParams.set('password', password);
-            window.location.href = currentUrl.toString();
-        }
-    </script>
-</body>
-</html>`;
-
-	return new Response(html, {
-		status: 200,
-		headers: {
-			'Content-Type': 'text/html;charset=utf-8',
-			'Cache-Control': 'no-cache, no-store, must-revalidate',
-		},
-	});
-}
-
-/**
- * 获取主页内容(密码验证通过后显示)
- * @param {string} url 
- * @param {string} baseUrl 
- * @returns {Response}
- */
 function getMainPageContent(url, baseUrl) {
 	const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1354,7 +965,7 @@ function getMainPageContent(url, baseUrl) {
     <div class="container">
         <div class="logo"><img src="https://img.icons8.com/color/96/cloudflare.png" alt="Logo"></div>
         <h1 class="title">Workers Service</h1>
-        <p class="subtitle">基于 Cloudflare Workers 的高性能网络服务 (VLESS + Trojan)</p>
+        <p class="subtitle">基于 Cloudflare Workers 的高性能网络服务 (VLESS)</p>
         
         <div class="info-card">
             <div class="info-item">
