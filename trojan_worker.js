@@ -1,11 +1,11 @@
 // 需要开启环境变量，将544——546行前的//号去掉
 import { connect } from 'cloudflare:sockets';
 
-let subPath = 'link';     // 节点订阅路径,不修改将使用/sub/${UUID}作为订阅路径
-let proxyIP = '13.230.34.30';  // proxyIP
-let yourUUID = '5dc15e15-f285-4a9d-959b-0e4fbdd77b63'; // UUID
+let subPath = 'sub';     // 节点订阅路径,不修改将使用/sub/${UUID}作为订阅路径
+let proxyIP = 'proxy.xxxxxxxx.tk:50001';  // proxyIP
+let yourUUID = '757e052c-4159-491d-bc5d-1b6bd866d980'; // UUID
 
-let cfip = [ 'mfa.gov.ua#SG','saas.sin.fan#HK','store.ubi.com#JP','cf.130519.xyz#KR','cf.008500.xyz#HK','cf.090227.xyz#SG','cf.877774.xyz#HK','cdns.doon.eu.org#JP','sub.danfeng.eu.org#TW','cf.zhetengsha.eu.org#HK'];
+let cfip = [ '172.64.34.59:443#多选', '172.64.156.99:443#移动','172.67.71.114:443#联通','108.162.198.119:443#电信'];
 
 function closeSocketQuietly(socket) { 
     try { if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) { socket.close(); }
@@ -609,7 +609,7 @@ export default {
                         } else {
                             host = cdnItem;
                         }
-                        const troNodeName = nodeName ? `${nodeName}-${troHeader}` : `Workers-${troHeader}`;
+                        const troNodeName = nodeName ? `${nodeName}` : `Workers-${troHeader}`;
                         return `${troHeader}://${yourUUID}@${host}:${port}?security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=1&type=ws&host=${currentDomain}&path=%2F%3Fed%3D2560#${troNodeName}`;
                     });
                     const linksText = troLinks.join('\n');
