@@ -8,14 +8,12 @@ import { connect } from 'cloudflare:sockets';
 
 // ============ 配置区域 ============
 let subPath = 'sub';
-let proxyIP = 'proxy.xxxxxxxx.tk:50001';
 let yourUUID = '757e052c-4159-491d-bc5d-1b6bd866d980';
 
 let cfip = [
-    '172.64.34.59:443#多选',
-    '172.64.156.99:443#移动',
-    '172.67.71.114:443#联通',
-    '108.162.198.119:443#电信'
+    '50.62.172.207:2096#LHR',
+    '50.62.173.32:2096#LHR',
+    '156.231.141.37:2087#NRT'
 ];
 
 // ============ 工具函数 ============
@@ -232,41 +230,6 @@ async function connectRemote(host, port, data, ws, header, customProxy) {
     } catch (err) {
         console.error('Direct failed, trying proxy:', err.message);
         return await viaProxy();
-    }
-}
-
-// ============ SOCKS5 连接 ============
-async function connectSOCKS5(cfg, host, port, data) {
-    const sock = connect({ hostname: cfg.host, port: cfg.port });
-    const w = sock.writable.getWriter();
-    const r = sock.readable.getReader();
-
-    try {
-        await w.write(cfg.username ? new Uint8Array([5, 2, 0, 2]) : new Uint8Array([5, 1, 0]));
-        const auth = await r.read();
-        const method = new Uint8Array(auth.value)[1];
-
-        if (method === 2) {
-            const user = new TextEncoder().encode(cfg.username);
-            const pass = new TextEncoder().encode(cfg.password);
-            const packet = new Uint8Array([1, user.length, ...user, pass.length, ...pass]);
-            await w.write(packet);
-            await r.read();
-        }
-
-        const hostBytes = new TextEncoder().encode(host);
-        const req = new Uint8Array([5, 1, 0, 3, hostBytes.length, ...hostBytes, port >> 8, port & 0xff]);
-        await w.write(req);
-        await r.read();
-        await w.write(data);
-
-        w.releaseLock();
-        r.releaseLock();
-        return sock;
-    } catch (err) {
-        w.releaseLock();
-        r.releaseLock();
-        throw err;
     }
 }
 
