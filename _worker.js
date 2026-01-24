@@ -9,8 +9,9 @@ export default {
 		// 优选 IP 列表（格式：IP:端口#地区标识）
 		// 这些 IP 可以用作 ProxyIP，也会出现在订阅中
 		const PREFERRED_IPS = [
-			'proxyip.us.cmliussss.net:443#US',
-			'proxyip.jp.cmliussss.net:443#JP'
+			'138.2.45.232:443#JP',
+			'34.158.60.217:443#SG',
+			'103.219.194.43:443#HK'
 			// 可以继续添加更多优选IP
 			// '1.2.3.4:443#HKG',
 			// '5.6.7.8:2096#SIN',
