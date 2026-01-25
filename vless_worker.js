@@ -10,7 +10,7 @@ import { connect } from 'cloudflare:sockets';
 
 // ============ 配置区域 ============
 let subPath = 'sub';
-let proxyIP = '138.2.45.232:443';
+let proxyIP = 'proxy.xxxxxxxx.tk:50001';
 let yourUUID = '757e052c-4159-491d-bc5d-1b6bd866d980';
 
 let cfip = [
