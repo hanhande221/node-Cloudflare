@@ -14,9 +14,8 @@ let proxyIP = 'proxy.xxxxxxxx.tk:50001';
 let yourUUID = '757e052c-4159-491d-bc5d-1b6bd866d980';
 
 let cfip = [
-    '138.2.45.232:443#JP',
-	'34.158.60.217:443#SG',
-	'103.219.194.43:443#HK'
+    'proxyip.us.cmliussss.net:443#US',
+	'proxyip.jp.cmliussss.net:443#JP'
 ];
 
 // ============ 核心工具函数 ============
