@@ -8,12 +8,15 @@ import { connect } from 'cloudflare:sockets';
 
 // ============ 配置区域 ============
 let subPath = 'sub';
-let proxyIP = 'proxyIP';
-let yourUUID = 'UUID';
+let proxyIP = 'proxy.xxxxxxxx.tk:50001';
+let yourUUID = '757e052c-4159-491d-bc5d-1b6bd866d980';
 
 let cfip = [
-    'ip:443#US',
-	'ip:443#JP'
+    '104.18.5.101:443#US',
+    '103.238.129.84:8443#JP',
+    '141.193.213.21:443#HK',
+    '199.34.228.41:443#SB',
+    '175.123.172.254:30001#KR'
 ];
 
 // ============ 核心工具函数 ============
