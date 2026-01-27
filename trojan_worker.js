@@ -1,22 +1,19 @@
-// ============================================
-// 主要功能:
-// Trojan Cloudflare Workers 代理脚本
-// 添加 let proxyIP = 'proxyIP' 格式
-// 添加 let yourUUID = 'UUID'
-// 订阅方式:你的访问地址 /UUID 进入订阅中心
-// let cfip='104.18.5.101:443#US','141.193.213.21:443#HK'
-// ============================================
+// ============ 参数信息 ============
+// let proxyIP = 'proxyIP'（格式：IP/域名:端口）
+// let password = 'UUID' 格式 UUID
+// 优选 IP 列表（格式：IP/域名:端口#地区标识）
+// 订阅方式，你的访问地址 /UUID 进入订阅中心
 
 import { connect } from 'cloudflare:sockets';
 
 // ============ 配置区域 ============
-let subPath = '';
-let proxyIP = '';
-let yourUUID = '';
+let subPath = 'sub';
+let proxyIP = 'proxyIP';
+let yourUUID = 'UUID';
 
 let cfip = [
-    '104.18.5.101:443#US',
-	'141.193.213.21:443#HK'
+    'ip:443#US',
+	'ip:443#HK'
 ];
 
 // ============ 核心工具函数 ============
