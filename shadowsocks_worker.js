@@ -10,7 +10,6 @@ import { connect } from 'cloudflare:sockets';
 let subPath = 'sub';
 let proxyIP = 'proxyIP';
 let password = 'UUID';
-let SSpath = '';          // 路径验证，为空则使用UUID作为验证路径
 
 // CF-CDN 
 let cfip = [
