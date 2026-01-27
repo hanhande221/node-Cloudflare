@@ -1,21 +1,18 @@
-// ========== 参数信息修改 ==========
-//const UUID = env.UUID || 'UUID';
-//const PREFERRED_IPS =优选IP（格式：ip/域名:端口#国家代码）
-// 订阅信息配置
-	//const uploadGB = 9.9;           // 上传流量（GB）
-	//const downloadGB = 13.0;        // 下载流量（GB）
-	//const totalGB = 100;            // 总流量（GB）
-	//const expireDate = '2026-11-13'; // 过期日期
-
+import { connect } from 'cloudflare:sockets';
 
 export default {
 	async fetch(req, env) {
 		// ========== 配置区域 ==========
-		const UUID = env.UUID || 'UUID'; //例如757e052c-4159-491d-bc5d-1b6bd866d980
+		const UUID = env.UUID || '757e052c-4159-491d-bc5d-1b6bd866d980';
 		
 		const PREFERRED_IPS = [
-			'ip:443#US',
-			'ip:443#HK',
+			'104.18.5.101:443#一元机场',
+			'141.193.213.21:443#邀请30%返利',
+			'104.194.64.142:443#US',
+			'207.148.99.230:443#JP',
+			'43.160.202.33:443#SG',
+			'112.119.8.12:443#HK',
+			'221.158.168.29:50001#KR'
 		];
 		
 		// ========== 订阅生成处理 ==========
