@@ -1,21 +1,19 @@
-// ============================================
-// 主要功能:
-// VLESS Cloudflare Workers 代理脚本
-// 替换 let proxyIP = '路径内容' 可修改 proxyIP
-// 替换 let yourUUID = '路径内容' 可修改 UUID
-// 订阅方式:你的访问地址 /UUID 进入订阅中心
-// ============================================
+// ============ 参数信息 ============
+// let proxyIP = 'proxyIP'（格式：IP/域名:端口）
+// let password = 'UUID' 格式 UUID
+// 优选 IP 列表（格式：IP/域名:端口#地区标识）
+// 订阅方式，你的访问地址 /UUID 进入订阅中心
 
 import { connect } from 'cloudflare:sockets';
 
 // ============ 配置区域 ============
 let subPath = 'sub';
-let proxyIP = 'proxy.xxxxxxxx.tk:50001';
-let yourUUID = '757e052c-4159-491d-bc5d-1b6bd866d980';
+let proxyIP = 'proxyIP';
+let yourUUID = 'UUID';
 
 let cfip = [
-    'proxyip.us.cmliussss.net:443#US',
-	'proxyip.jp.cmliussss.net:443#JP'
+    'ip:443#US',
+	'ip:443#JP'
 ];
 
 // ============ 核心工具函数 ============
