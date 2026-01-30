@@ -3,10 +3,24 @@ import { connect } from 'cloudflare:sockets';
 // ==================== 配置区 ====================
 const CONFIG = {
 	uuid: '757e052c-4159-491d-bc5d-1b6bd866d980',
-	proxyIP: '141.193.213.21:443',
-	proxyName: 'HK',
-	socks5: null, // 格式: 'user:pass@host:port'
-	dnsServer: 'https://1.1.1.1/dns-query'
+	
+	// ProxyIP 中转服务器
+	proxyIP: 'proxy.xxxxxxxx.tk:50001',
+	
+	// SOCKS5 代理服务器（格式: 'user:pass@host:port' 或 'host:port'）
+	socks5: '107.182.173.176:1080',
+	
+	dnsServer: 'https://1.1.1.1/dns-query',
+	
+	// 优选IP列表 - 支持多节点
+	proxyNodes: [
+		{ ip: '103.238.129.84', port: 8443, name: 'JP' },
+		{ ip: '141.193.213.21', port: 443, name: 'HK' },
+		{ ip: '199.34.228.41', port: 443, name: 'SB' }
+	],
+	
+	// 默认连接顺序：优选IP直连 → ProxyIP → SOCKS5
+	defaultConnectionOrder: ['direct', 'proxy', 's5']
 };
 
 // ==================== 订阅生成器 ====================
@@ -16,42 +30,61 @@ class SubscriptionGenerator {
 		this.config = config;
 	}
 
-	generateVlessConfig() {
+	generateVlessConfig(node) {
 		const params = new URLSearchParams({
 			encryption: 'none',
 			type: 'ws',
 			host: this.hostname,
-			path: this.buildPath(),
+			path: this.buildPath(node),
 			security: 'tls',
 			sni: this.hostname,
 			fp: 'chrome',
 			alpn: 'h2,http/1.1'
 		});
 
-		const vlessUrl = `vless://${this.config.uuid}@${this.config.proxyIP.split(':')[0]}:${this.config.proxyIP.split(':')[1] || 443}?${params.toString()}#${encodeURIComponent(this.config.proxyName)}`;
+		const vlessUrl = `vless://${this.config.uuid}@${node.ip}:${node.port}?${params.toString()}#${encodeURIComponent(node.name)}`;
 		
-		return btoa(vlessUrl);
+		return vlessUrl;
 	}
 
-	buildPath() {
+	buildPath(node) {
 		const params = new URLSearchParams();
 		params.set('mode', 'auto');
 		
+		// 按照默认连接顺序添加参数
+		// 优选IP直连
+		params.set('proxyip', `${node.ip}:${node.port}`);
+		
+		// ProxyIP（如果配置）
 		if (this.config.proxyIP) {
-			params.set('proxyip', this.config.proxyIP);
+			// ProxyIP 作为第二选择，已通过proxyip参数设置
 		}
 		
+		// SOCKS5（如果配置）
 		if (this.config.socks5) {
 			params.set('s5', this.config.socks5);
 		}
 		
+		// 直连标记
 		params.set('direct', '');
 		
 		return `/?${params.toString()}`;
 	}
 
-	generate() {
-		return this.generateVlessConfig();
+	generateAll() {
+		const vlessConfigs = this.config.proxyNodes.map(node => 
+			this.generateVlessConfig(node)
+		);
+		
+		// 将所有节点配置合并，用换行符分隔，然后 Base64 编码
+		return btoa(vlessConfigs.join('\n'));
+	}
+
+	generateSingle(nodeName) {
+		const node = this.config.proxyNodes.find(n => n.name === nodeName);
+		if (!node) return null;
+		
+		return btoa(this.generateVlessConfig(node));
 	}
 }
 
@@ -64,13 +97,23 @@ class ConnectionManager {
 	}
 
 	parseSocks5(s5String) {
-		if (!s5String || !s5String.includes('@')) return null;
+		if (!s5String) return null;
 		
-		const [credentials, server] = s5String.split('@');
-		const [user, pass] = credentials.split(':');
-		const [host, port = '443'] = server.split(':');
+		// 移除 socks5:// 前缀（如果有）
+		const cleaned = s5String.replace(/^socks5:\/\//, '');
 		
-		return { user, pass, host, port: parseInt(port) };
+		// 支持两种格式：
+		// 1. user:pass@host:port （带认证）
+		// 2. host:port （无认证）
+		if (cleaned.includes('@')) {
+			const [credentials, server] = cleaned.split('@');
+			const [user, pass] = credentials.split(':');
+			const [host, port = '1080'] = server.split(':');
+			return { user, pass, host, port: parseInt(port) };
+		} else {
+			const [host, port = '1080'] = cleaned.split(':');
+			return { user: null, pass: null, host, port: parseInt(port) };
+		}
 	}
 
 	parseProxy(proxyString) {
@@ -93,11 +136,12 @@ class ConnectionManager {
 		const writer = socket.writable.getWriter();
 		const reader = socket.readable.getReader();
 		
-		// 认证协商
-		await writer.write(new Uint8Array([5, 2, 0, 2]));
+		// 认证协商（支持无认证和用户名密码认证）
+		const authMethods = this.socks5Config.user ? [5, 2, 0, 2] : [5, 1, 0];
+		await writer.write(new Uint8Array(authMethods));
 		const authResponse = (await reader.read()).value;
 		
-		// 用户名密码认证
+		// 用户名密码认证（如果需要）
 		if (authResponse[1] === 2 && this.socks5Config.user) {
 			const userBytes = new TextEncoder().encode(this.socks5Config.user);
 			const passBytes = new TextEncoder().encode(this.socks5Config.pass);
@@ -369,9 +413,13 @@ function parseURLParameters(url) {
 }
 
 function getConnectionOrder(mode, searchParams) {
+	// 如果指定了proxy模式，使用传统顺序
 	if (mode === 'proxy') return ['direct', 'proxy'];
+	
+	// 如果指定了特定模式，只使用该模式
 	if (mode !== 'auto') return [mode];
 
+	// auto模式：检查URL参数来确定顺序
 	const order = [];
 	const searchString = searchParams.toString();
 	
@@ -381,7 +429,8 @@ function getConnectionOrder(mode, searchParams) {
 		else if (key === 'proxyip') order.push('proxy');
 	}
 
-	return order.length ? order : ['direct'];
+	// 如果URL中没有指定顺序，使用默认顺序：direct → proxy → s5
+	return order.length ? order : CONFIG.defaultConnectionOrder;
 }
 
 function decodeEarlyData(protocolHeader) {
@@ -403,12 +452,16 @@ async function handleWebSocket(request, env) {
 
 	const params = parseURLParameters(request.url);
 	
+	// 获取默认优选IP（第一个节点）
+	const defaultNode = CONFIG.proxyNodes[0];
+	const defaultProxyIP = `${defaultNode.ip}:${defaultNode.port}`;
+	
 	// 更新配置
 	const runtimeConfig = {
 		uuid,
-		proxyIP: params.proxyParam || CONFIG.proxyIP,
-		socks5: params.s5Param || CONFIG.socks5,
-		proxyName: CONFIG.proxyName
+		proxyIP: CONFIG.proxyIP, // 使用配置的 ProxyIP 中转服务器
+		socks5: params.s5Param || CONFIG.socks5, // SOCKS5 配置
+		proxyNodes: CONFIG.proxyNodes
 	};
 
 	const connectionManager = new ConnectionManager(runtimeConfig);
@@ -451,10 +504,21 @@ function handleSubscription(request) {
 	const url = new URL(request.url);
 	const generator = new SubscriptionGenerator(url.hostname, CONFIG);
 	
-	return new Response(generator.generate(), {
+	// 支持单节点订阅：/sub?node=HK
+	const nodeName = url.searchParams.get('node');
+	const subscription = nodeName 
+		? generator.generateSingle(nodeName) 
+		: generator.generateAll();
+	
+	if (!subscription) {
+		return new Response('节点不存在', { status: 404 });
+	}
+	
+	return new Response(subscription, {
 		headers: {
 			'Content-Type': 'text/plain;charset=utf-8',
-			'Cache-Control': 'no-store'
+			'Cache-Control': 'no-store',
+			'Content-Disposition': 'attachment; filename=vless-subscription.txt'
 		}
 	});
 }
