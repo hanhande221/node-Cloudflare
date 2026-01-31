@@ -11,8 +11,10 @@ const CONFIG = {
 	
 	// 优选IP列表 - 支持多节点 (可随时修改)
 	proxyNodes: [
+		{ ip: '104.18.5.101', port: 443, name: 'US' },
 		{ ip: '103.238.129.84', port: 8443, name: 'JP' },
 		{ ip: '141.193.213.21', port: 443, name: 'HK' },
+		{ ip: '175.123.172.254', port: 30001, name: 'KR' },
 		{ ip: '199.34.228.41', port: 443, name: 'SB' }
 	]
 };
