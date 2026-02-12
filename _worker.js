@@ -6,25 +6,22 @@ export default {
 		// UUID 配置（从环境变量读取，或使用默认值）
 		const UUID = env.UUID || '757e052c-4159-491d-bc5d-1b6bd866d980';
 		
-		// 优选 IP 列表（格式：IP:端口#地区标识）
-		// 这些 IP 可以用作 ProxyIP，也会出现在订阅中
-		const PREFERRED_IPS = [
-			'104.238.180.123:443#一元机场',
+		// GitHub IP 列表 URL
+		const GITHUB_IP_URL = 'https://raw.githubusercontent.com/hanhande221/node-Cloudflare/main/ip.txt';
+		
+		// 默认备用 IP 列表（当 GitHub 获取失败时使用）
+		const FALLBACK_IPS = [
 			'104.194.64.142:443#US',
 			'45.32.55.253:443#JP',
-			'159.138.130.139:443#HK',
-			'43.160.202.33:443#SG',
+			'112.119.8.12:443#HK',
 			'221.158.168.29:50001#KR'
-			// 可以继续添加更多优选IP
-			// '1.2.3.4:443#HKG',
-			// '5.6.7.8:2096#SIN',
 		];
 		
 		// ========== 订阅生成处理 ==========
 		// 检查是否访问 /sub 路径，生成订阅内容
 		const url = new URL(req.url);
 		if (url.pathname === '/sub') {
-			return generateSubscription(req, UUID, PREFERRED_IPS);
+			return generateSubscription(req, UUID, GITHUB_IP_URL, FALLBACK_IPS);
 		}
 
 		// ========== WebSocket 连接处理 ==========
@@ -339,10 +336,48 @@ export default {
 	}
 };
 
+// ========== 从 GitHub 获取 IP 列表 ==========
+async function fetchIPsFromGitHub(githubUrl, fallbackIPs) {
+	try {
+		// 从 GitHub 获取 IP 列表
+		const response = await fetch(githubUrl, {
+			headers: {
+				'User-Agent': 'Cloudflare-Worker'
+			}
+		});
+		
+		if (!response.ok) {
+			console.error('GitHub fetch failed:', response.status);
+			return fallbackIPs;
+		}
+		
+		const text = await response.text();
+		
+		// 解析 IP 列表
+		const ips = text
+			.split('\n')
+			.map(line => line.trim())
+			.filter(line => {
+				// 过滤掉空行和注释行（以 // 开头）
+				return line && !line.startsWith('//');
+			});
+		
+		// 如果获取到的 IP 列表为空，使用备用列表
+		return ips.length > 0 ? ips : fallbackIPs;
+		
+	} catch (error) {
+		console.error('Error fetching IPs from GitHub:', error);
+		return fallbackIPs;
+	}
+}
+
 // ========== 订阅生成函数 ==========
-function generateSubscription(req, uuid, preferredIPs) {
+async function generateSubscription(req, uuid, githubUrl, fallbackIPs) {
 	const url = new URL(req.url);
 	const host = url.hostname;
+	
+	// 从 GitHub 获取 IP 列表
+	const preferredIPs = await fetchIPsFromGitHub(githubUrl, fallbackIPs);
 	
 	// 生成订阅节点列表
 	const nodes = [];
