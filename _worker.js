@@ -1,5 +1,4 @@
 import { connect } from 'cloudflare:sockets';
-
 const FIXED_UUID = '757e052c-4159-491d-bc5d-1b6bd866d980';
 const IP_SOURCE = 'https://raw.githubusercontent.com/hanhande221/node-Cloudflare/main/ip.txt';
 
@@ -8,25 +7,24 @@ export default {
     const url = new URL(request.url);
     const upgradeHeader = (request.headers.get('Upgrade') || '').toLowerCase();
     const contentType = (request.headers.get('content-type') || '').toLowerCase();
-    const UA = request.headers.get('User-Agent') || '';
     const pathname = url.pathname;
+
+    // ★ 从查询参数中提取 proxyip
+    const proxyIP = url.searchParams.get('proxyip') || null;
 
     if (pathname === '/sub') {
       return await handleSub(url, env);
     }
-
     if (upgradeHeader === 'websocket') {
-      return await handleWS(request, FIXED_UUID, url);
+      return await handleWS(request, FIXED_UUID, url, proxyIP);
     }
-
     if (request.method === 'POST') {
       const referer = request.headers.get('Referer') || '';
       if (!referer.includes('x_padding') && contentType.startsWith('application/grpc')) {
-        return await handleGRPC(request, FIXED_UUID);
+        return await handleGRPC(request, FIXED_UUID, proxyIP);
       }
-      return await handleXHTTP(request, FIXED_UUID);
+      return await handleXHTTP(request, FIXED_UUID, proxyIP);
     }
-
     return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html;charset=utf-8' } });
   }
 };
@@ -35,7 +33,6 @@ export default {
 async function handleSub(url, env) {
   const host = url.hostname;
   let ipList = [];
-
   try {
     const res = await fetch(IP_SOURCE);
     const text = await res.text();
@@ -43,17 +40,14 @@ async function handleSub(url, env) {
   } catch (e) {
     ipList = ['104.16.0.0:443#CF优选'];
   }
-
   const nodes = ipList.map(line => {
     const hashIdx = line.indexOf('#');
     const addr = hashIdx > -1 ? line.slice(0, hashIdx) : line;
     const remark = hashIdx > -1 ? line.slice(hashIdx + 1) : addr;
     const [nodeAddr, nodePort = '443'] = splitAddrPort(addr);
-    // 优选IP同时作为ProxyIP，写入路径参数
     const path = `/?proxyip=${nodeAddr}`;
     return `vless://${FIXED_UUID}@${nodeAddr}:${nodePort}?security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}&sni=${host}&fp=chrome&encryption=none#${encodeURIComponent(remark)}`;
   });
-
   const content = btoa(nodes.join('\n'));
   return new Response(content, {
     headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': 'no-store' }
@@ -72,17 +66,15 @@ function splitAddrPort(addr) {
 }
 
 // ==================== XHTTP ====================
-async function handleXHTTP(request, uuid) {
+async function handleXHTTP(request, uuid, proxyIP) {  // ★ 接收 proxyIP
   if (!request.body) return new Response('Bad Request', { status: 400 });
   const reader = request.body.getReader();
   const first = await parseXHTTPFirstPacket(reader, uuid);
   if (!first) return new Response('Invalid request', { status: 400 });
   if (isBlocked(first.hostname)) return new Response('Forbidden', { status: 403 });
   if (first.isUDP && first.port !== 53) return new Response('UDP not supported', { status: 400 });
-
   const conn = { socket: null, connectingPromise: null, retryConnect: null };
   let curSocket = null, curWriter = null;
-
   const releaseWriter = () => {
     if (curWriter) { try { curWriter.releaseLock() } catch (e) { } curWriter = null; }
     curSocket = null;
@@ -93,9 +85,7 @@ async function handleXHTTP(request, uuid) {
     if (s !== curSocket) { releaseWriter(); curSocket = s; curWriter = s.writable.getWriter(); }
     return curWriter;
   };
-
   const headers = new Headers({ 'Content-Type': 'application/octet-stream', 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store' });
-
   return new Response(new ReadableStream({
     async start(controller) {
       let closed = false;
@@ -115,7 +105,6 @@ async function handleXHTTP(request, uuid) {
           try { controller.close() } catch (e) { }
         }
       };
-
       const writeRemote = async (payload, retry = true) => {
         const w = getWriter();
         if (!w) return false;
@@ -126,12 +115,12 @@ async function handleXHTTP(request, uuid) {
           throw e;
         }
       };
-
       try {
         if (first.isUDP) {
           if (first.rawData?.byteLength) { await fwdUDP(first.rawData, bridge, udpRespHeader); udpRespHeader = null; }
         } else {
-          await fwdTCP(first.hostname, first.port, first.rawData, bridge, first.respHeader, conn, uuid);
+          // ★ 传入 proxyIP
+          await fwdTCP(first.hostname, first.port, first.rawData, bridge, first.respHeader, conn, uuid, proxyIP);
         }
         while (true) {
           const { done, value } = await reader.read();
@@ -152,7 +141,6 @@ async function parseXHTTPFirstPacket(reader, token) {
   const decoder = new TextDecoder();
   const sha224pwd = sha224(token);
   const sha224bytes = new TextEncoder().encode(sha224pwd);
-
   const tryVLESS = (data) => {
     const len = data.byteLength;
     if (len < 18) return { s: 'need' };
@@ -184,7 +172,6 @@ async function parseXHTTPFirstPacket(reader, token) {
     if (!hostname) return { s: 'invalid' };
     return { s: 'ok', result: { hostname, port, isUDP: cmd === 2, rawData: data.subarray(headerLen), respHeader: new Uint8Array([data[0], 0]) } };
   };
-
   const tryTrojan = (data) => {
     const len = data.byteLength;
     if (len < 58) return { s: 'need' };
@@ -213,7 +200,6 @@ async function parseXHTTPFirstPacket(reader, token) {
     if (data[cursor + 2] !== 0x0d || data[cursor + 3] !== 0x0a) return { s: 'invalid' };
     return { s: 'ok', result: { hostname, port, isUDP: false, rawData: data.subarray(cursor + 4), respHeader: null } };
   };
-
   let buffer = new Uint8Array(1024), offset = 0;
   while (true) {
     const { value, done } = await reader.read();
@@ -236,15 +222,13 @@ async function parseXHTTPFirstPacket(reader, token) {
 }
 
 // ==================== gRPC ====================
-async function handleGRPC(request, uuid) {
+async function handleGRPC(request, uuid, proxyIP) {  // ★ 接收 proxyIP
   if (!request.body) return new Response('Bad Request', { status: 400 });
   const reader = request.body.getReader();
   const conn = { socket: null, connectingPromise: null, retryConnect: null };
   let isDNS = false, isTrojan = null, curSocket = null, curWriter = null;
   const FLUSH_LIMIT = 64 * 1024, FLUSH_INTERVAL = 20;
-
   const headers = new Headers({ 'Content-Type': 'application/grpc', 'grpc-status': '0', 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store' });
-
   return new Response(new ReadableStream({
     async start(controller) {
       let closed = false, queue = [], queueBytes = 0, timer = null;
@@ -266,7 +250,6 @@ async function handleGRPC(request, uuid) {
         },
         close() { if (this.readyState === WebSocket.CLOSED) return; flush(true); closed = true; this.readyState = WebSocket.CLOSED; try { controller.close() } catch (e) { } }
       };
-
       const flush = (force = false) => {
         if (timer) { clearTimeout(timer); timer = null; }
         if ((!force && closed) || queueBytes === 0) return;
@@ -275,7 +258,6 @@ async function handleGRPC(request, uuid) {
         queue = []; queueBytes = 0;
         try { controller.enqueue(out); } catch (e) { closed = true; bridge.readyState = WebSocket.CLOSED; }
       };
-
       const releaseWriter = () => {
         if (curWriter) { try { curWriter.releaseLock() } catch (e) { } curWriter = null; } curSocket = null;
       };
@@ -285,7 +267,6 @@ async function handleGRPC(request, uuid) {
         try { await curWriter.write(payload); return true; }
         catch (e) { releaseWriter(); if (retry && conn.retryConnect) { await conn.retryConnect(); return writeRemote(payload, false); } throw e; }
       };
-
       try {
         let pending = new Uint8Array(0);
         while (true) {
@@ -314,7 +295,8 @@ async function handleGRPC(request, uuid) {
               const r = parseTrojan(payload.buffer instanceof ArrayBuffer ? payload.buffer : new Uint8Array(payload).buffer, uuid);
               if (r?.hasError) throw new Error(r.message);
               if (isBlocked(r.hostname)) throw new Error('Blocked');
-              await fwdTCP(r.hostname, r.port, r.rawClientData, bridge, null, conn, uuid);
+              // ★ 传入 proxyIP
+              await fwdTCP(r.hostname, r.port, r.rawClientData, bridge, null, conn, uuid, proxyIP);
             } else {
               const r = parseVLESS(payload.buffer instanceof ArrayBuffer ? payload.buffer : new Uint8Array(payload).buffer, uuid);
               if (r?.hasError) throw new Error(r.message);
@@ -324,7 +306,8 @@ async function handleGRPC(request, uuid) {
               bridge.send(respHeader);
               const rawData = payload.buffer instanceof ArrayBuffer ? payload.buffer.slice(r.rawIndex) : new Uint8Array(payload).buffer.slice(r.rawIndex);
               if (isDNS) await fwdUDP(rawData, bridge, null);
-              else await fwdTCP(r.hostname, r.port, rawData, bridge, null, conn, uuid);
+              // ★ 传入 proxyIP
+              else await fwdTCP(r.hostname, r.port, rawData, bridge, null, conn, uuid, proxyIP);
             }
           }
           flush();
@@ -337,7 +320,7 @@ async function handleGRPC(request, uuid) {
 }
 
 // ==================== WebSocket ====================
-async function handleWS(request, uuid, url) {
+async function handleWS(request, uuid, url, proxyIP) {  // ★ 接收 proxyIP
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
   server.accept(); server.binaryType = 'arraybuffer';
@@ -345,7 +328,6 @@ async function handleWS(request, uuid, url) {
   let isDNS = false, proto = null, curSocket = null, curWriter = null;
   const earlyData = request.headers.get('sec-websocket-protocol') || '';
   let cancelled = false, streamClosed = false;
-
   const readable = new ReadableStream({
     start(ctrl) {
       const isClosedErr = (e) => { const m = e?.message||`${e||''}`; return m.includes('ReadableStream is closed')||m.includes('already closed'); };
@@ -358,7 +340,6 @@ async function handleWS(request, uuid, url) {
     },
     cancel() { cancelled = true; streamClosed = true; closeQuiet(server); }
   });
-
   const releaseWriter = () => { if (curWriter) { try { curWriter.releaseLock() } catch (e) { } curWriter = null; } curSocket = null; };
   const writeRemote = async (chunk, retry = true) => {
     const s = conn.socket; if (!s) return false;
@@ -366,7 +347,6 @@ async function handleWS(request, uuid, url) {
     try { await curWriter.write(chunk); return true; }
     catch (e) { releaseWriter(); if (retry && conn.retryConnect) { await conn.retryConnect(); return writeRemote(chunk, false); } throw e; }
   };
-
   readable.pipeTo(new WritableStream({
     async write(chunk) {
       if (isDNS) { await fwdUDP(chunk, server, null); return; }
@@ -380,7 +360,8 @@ async function handleWS(request, uuid, url) {
         const r = parseTrojan(chunk, uuid);
         if (r?.hasError) throw new Error(r.message);
         if (isBlocked(r.hostname)) throw new Error('Blocked');
-        await fwdTCP(r.hostname, r.port, r.rawClientData, server, null, conn, uuid);
+        // ★ 传入 proxyIP
+        await fwdTCP(r.hostname, r.port, r.rawClientData, server, null, conn, uuid, proxyIP);
       } else {
         const r = parseVLESS(chunk, uuid);
         if (r?.hasError) throw new Error(r.message);
@@ -389,13 +370,13 @@ async function handleWS(request, uuid, url) {
         const respHeader = new Uint8Array([r.version[0], 0]);
         const rawData = chunk.slice(r.rawIndex);
         if (isDNS) return fwdUDP(rawData, server, respHeader);
-        await fwdTCP(r.hostname, r.port, rawData, server, respHeader, conn, uuid);
+        // ★ 传入 proxyIP
+        await fwdTCP(r.hostname, r.port, rawData, server, respHeader, conn, uuid, proxyIP);
       }
     },
     close() { releaseWriter(); },
     abort() { releaseWriter(); }
   })).catch(() => { releaseWriter(); closeQuiet(server); });
-
   return new Response(null, { status: 101, webSocket: client });
 }
 
@@ -440,46 +421,93 @@ function parseVLESS(chunk, token) {
 }
 
 // ==================== TCP/UDP转发 ====================
-async function fwdTCP(host, port, rawData, ws, respHeader, conn, uuid) {
-  // 从请求路径中提取proxyip参数
-  let proxyIP = null;
-  // proxyIP由外部设置，这里直接尝试直连，失败则无法回退（精简版去掉proxyip自动路由）
-  // 实际proxyip通过订阅节点path中的参数在客户端层面体现
+// ★★★ 核心修复：fwdTCP 加入 proxyIP 参数，实现直连失败后走 ProxyIP 的回退逻辑 ★★★
+async function fwdTCP(host, port, rawData, ws, respHeader, conn, uuid, proxyIP) {
+  const TIMEOUT = 5000;
 
-  const TIMEOUT = 3000;
-  const waitOpen = (sock, ms=TIMEOUT) => Promise.race([sock.opened, new Promise((_,r)=>setTimeout(()=>r(new Error('timeout')),ms))]);
+  const waitOpen = (sock, ms = TIMEOUT) =>
+    Promise.race([sock.opened, new Promise((_, r) => setTimeout(() => r(new Error('connect timeout')), ms))]);
 
-  let sentFirst = false;
-  const connectProxy = async (retry = true) => {
+  // 尝试建立一条 TCP 连接，connectHost/connectPort 是实际连接目标
+  const tryConnect = async (connectHost, connectPort) => {
+    const sock = connect({ hostname: connectHost, port: connectPort });
+    await waitOpen(sock);
+    return sock;
+  };
+
+  // 写入初始数据
+  const writeInit = async (sock) => {
+    if (rawData && (rawData.byteLength ?? rawData.length ?? 0) > 0) {
+      const w = sock.writable.getWriter();
+      await w.write(rawData instanceof ArrayBuffer ? new Uint8Array(rawData) : rawData);
+      w.releaseLock();
+    }
+  };
+
+  // 解析 proxyIP，支持 host:port 格式，默认端口 443
+  let proxyHost = null, proxyPort = 443;
+  if (proxyIP) {
+    const [ph, pp] = splitAddrPort(proxyIP);
+    proxyHost = ph;
+    proxyPort = parseInt(pp, 10) || 443;
+  }
+
+  let sock = null;
+
+  try {
+    // 第一步：先尝试直连目标
+    sock = await tryConnect(host, port);
+  } catch (e) {
+    // 直连失败，如果有 proxyIP 则尝试走代理
+    if (proxyHost) {
+      try {
+        sock = await tryConnect(proxyHost, proxyPort);
+      } catch (e2) {
+        closeQuiet(ws);
+        return;
+      }
+    } else {
+      closeQuiet(ws);
+      return;
+    }
+  }
+
+  // 设置重试逻辑：重试时优先用 proxyIP
+  conn.retryConnect = async () => {
     if (conn.connectingPromise) { await conn.connectingPromise; return; }
-    const sendFirst = !sentFirst && rawData && (rawData.byteLength ?? rawData.length ?? 0) > 0;
     const task = (async () => {
-      const sock = connect({ hostname: host, port });
-      await waitOpen(sock);
-      if (sendFirst) { const w = sock.writable.getWriter(); await w.write(rawData instanceof ArrayBuffer ? new Uint8Array(rawData) : rawData); w.releaseLock(); sentFirst = true; }
-      conn.socket = sock;
-      sock.closed.catch(()=>{}).finally(()=>closeQuiet(ws));
-      pipeRemote(sock, ws, respHeader, null);
+      let retrySock = null;
+      // 优先用 proxyIP 重试，其次回退直连
+      const attempts = proxyHost
+        ? [{ h: proxyHost, p: proxyPort }, { h: host, p: port }]
+        : [{ h: host, p: port }];
+      for (const { h, p } of attempts) {
+        try { retrySock = await tryConnect(h, p); break; } catch (e) { }
+      }
+      if (!retrySock) { closeQuiet(ws); return; }
+      conn.socket = retrySock;
+      retrySock.closed.catch(() => {}).finally(() => closeQuiet(ws));
+      pipeRemote(retrySock, ws, null, null);
     })();
     conn.connectingPromise = task;
     try { await task; } finally { if (conn.connectingPromise === task) conn.connectingPromise = null; }
   };
-  conn.retryConnect = () => connectProxy(false);
 
-  try {
-    const sock = connect({ hostname: host, port });
-    await waitOpen(sock);
-    if (rawData && (rawData.byteLength ?? rawData.length ?? 0) > 0) {
-      const w = sock.writable.getWriter();
-      await w.write(rawData instanceof ArrayBuffer ? new Uint8Array(rawData) : rawData);
-      w.releaseLock(); sentFirst = true;
-    }
-    conn.socket = sock;
-    sock.closed.catch(()=>{}).finally(()=>closeQuiet(ws));
-    pipeRemote(sock, ws, respHeader, async () => { if (conn.socket !== sock) return; await connectProxy(); });
-  } catch (e) {
-    await connectProxy();
-  }
+  conn.socket = sock;
+  await writeInit(sock);
+  sock.closed.catch(() => {}).finally(() => closeQuiet(ws));
+
+  // 如果直连成功但没有数据返回，自动用 proxyIP 重试
+  pipeRemote(sock, ws, respHeader, proxyHost ? async () => {
+    if (conn.socket !== sock) return;
+    // 直连无数据，尝试 proxyIP
+    let proxySock = null;
+    try { proxySock = await tryConnect(proxyHost, proxyPort); } catch (e) { return; }
+    conn.socket = proxySock;
+    await writeInit(proxySock);
+    proxySock.closed.catch(() => {}).finally(() => closeQuiet(ws));
+    pipeRemote(proxySock, ws, respHeader, null);
+  } : null);
 }
 
 async function fwdUDP(chunk, ws, respHeader) {
