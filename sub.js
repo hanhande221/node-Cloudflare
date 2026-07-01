@@ -157,13 +157,11 @@ async function handleSaveSubList(request, env) {
   try { body = await request.json(); } catch { return err("bad request"); }
   const sublist = body.sublist || [];
   
-  // 如果列表为空，直接保存空数组
   if (sublist.length === 0) {
     await env.KV.put(KV_SUBLIST, JSON.stringify([]));
     return ok({ ok: true });
   }
   
-  // 验证 token 不能重复
   const tokens = new Set();
   for (const item of sublist) {
     if (!item.token || !item.token.trim()) {
@@ -174,6 +172,24 @@ async function handleSaveSubList(request, env) {
       return err(`Token "${token}" 重复`, 400);
     }
     tokens.add(token);
+    
+    if (item.expiry && isNaN(Date.parse(item.expiry))) {
+      return err(`订阅 "${item.name}" 的过期时间格式无效`, 400);
+    }
+    
+    // 验证流量格式
+    if (item.traffic) {
+      const traffic = item.traffic;
+      if (traffic.upload && !traffic.upload.match(/^[\d.]+[KMGT]?B?$/i)) {
+        return err(`订阅 "${item.name}" 的上传流量格式无效`, 400);
+      }
+      if (traffic.download && !traffic.download.match(/^[\d.]+[KMGT]?B?$/i)) {
+        return err(`订阅 "${item.name}" 的下载流量格式无效`, 400);
+      }
+      if (traffic.total && !traffic.total.match(/^[\d.]+[KMGT]?B?$/i)) {
+        return err(`订阅 "${item.name}" 的总流量格式无效`, 400);
+      }
+    }
   }
   
   await env.KV.put(KV_SUBLIST, JSON.stringify(sublist));
@@ -193,29 +209,36 @@ function parseBytes(str) {
 async function handleSub(request, env, url) {
   const reqToken = url.searchParams.get("token") || "";
   
-  // 获取主订阅 Token
   const mainToken = await env.KV.get(KV_SUBTOKEN) || "";
   
-  // 情况1: 提供了 token
   if (reqToken) {
-    // 检查是否是主订阅 Token
     if (mainToken && reqToken === mainToken) {
       return handleMainSub(request, env, url);
     }
     
-    // 检查是否是自定义订阅
     let sublist = [];
     try { sublist = JSON.parse(await env.KV.get(KV_SUBLIST) || "[]"); } catch {}
     const subConfig = sublist.find(s => s.token === reqToken);
     if (subConfig) {
+      if (subConfig.expiry) {
+        const now = new Date();
+        const expiryDate = new Date(subConfig.expiry);
+        // 按天比较
+        now.setHours(0, 0, 0, 0);
+        expiryDate.setHours(0, 0, 0, 0);
+        if (expiryDate < now) {
+          return new Response("Subscription expired", { 
+            status: 403,
+            headers: { "Content-Type": "text/plain; charset=utf-8" }
+          });
+        }
+      }
       return handleCustomSub(request, env, url, subConfig);
     }
     
     return new Response("Invalid token", { status: 403 });
   }
   
-  // 情况2: 没有提供 token
-  // 如果设置了主 Token，必须带 token 访问
   if (mainToken && mainToken.length > 0) {
     return new Response("Missing token parameter. Please use ?token=xxx", { 
       status: 400,
@@ -223,7 +246,6 @@ async function handleSub(request, env, url) {
     });
   }
   
-  // 情况3: 没有设置主 Token，公开访问
   return handleMainSub(request, env, url);
 }
 
@@ -255,7 +277,7 @@ async function handleMainSub(request, env, url) {
     }
   }));
 
-  return buildSubResponse(out, env);
+  return buildSubResponse(out, env, null);
 }
 
 async function handleCustomSub(request, env, url, subConfig) {
@@ -289,21 +311,48 @@ async function handleCustomSub(request, env, url, subConfig) {
     }
   }));
 
-  return buildSubResponse(out, env);
+  return buildSubResponse(out, env, subConfig);
 }
 
-async function buildSubResponse(out, env) {
+async function buildSubResponse(out, env, subConfig) {
   const encoded = btoa(unescape(encodeURIComponent(out.join("\n"))));
 
-  const expiryStr = await env.KV.get(KV_EXPIRY) || "";
-  let trafficObj = { upload: "", download: "", total: "" };
-  try { trafficObj = JSON.parse(await env.KV.get(KV_TRAFFIC) || "{}"); } catch {}
+  // 获取全局流量
+  let globalTraffic = { upload: "", download: "", total: "" };
+  try { globalTraffic = JSON.parse(await env.KV.get(KV_TRAFFIC) || "{}"); } catch {}
 
   const parts = [];
-  if (trafficObj.upload)   parts.push("upload="   + parseBytes(trafficObj.upload));
-  if (trafficObj.download) parts.push("download=" + parseBytes(trafficObj.download));
-  if (trafficObj.total)    parts.push("total="    + parseBytes(trafficObj.total));
-  if (expiryStr)           parts.push("expire="   + Math.floor(new Date(expiryStr).getTime() / 1000));
+  
+  // 优先使用自定义订阅的流量，如果没有则使用全局流量
+  let upload = globalTraffic.upload;
+  let download = globalTraffic.download;
+  let total = globalTraffic.total;
+  
+  if (subConfig && subConfig.traffic) {
+    if (subConfig.traffic.upload !== undefined) upload = subConfig.traffic.upload;
+    if (subConfig.traffic.download !== undefined) download = subConfig.traffic.download;
+    if (subConfig.traffic.total !== undefined) total = subConfig.traffic.total;
+  }
+  
+  if (upload) parts.push("upload=" + parseBytes(upload));
+  if (download) parts.push("download=" + parseBytes(download));
+  if (total) parts.push("total=" + parseBytes(total));
+  
+  // 获取到期时间
+  const globalExpiry = await env.KV.get(KV_EXPIRY) || "";
+  let finalExpiry = globalExpiry;
+  if (subConfig && subConfig.expiry) {
+    finalExpiry = subConfig.expiry;
+  }
+  
+  if (finalExpiry) {
+    const dateObj = new Date(finalExpiry);
+    // 如果是 YYYY-MM-DD 格式，设置为当天 23:59:59
+    if (finalExpiry.match(/^\d{4}-\d{2}-\d{2}$/)) {
+      dateObj.setHours(23, 59, 59, 999);
+    }
+    parts.push("expire=" + Math.floor(dateObj.getTime() / 1000));
+  }
 
   const subname = await env.KV.get(KV_SUBNAME) || "";
   
@@ -383,13 +432,19 @@ function handleAdmin(origin) {
     ".token-none{background:rgba(107,112,151,.08);border-color:var(--bor);color:var(--mu)}",
     ".sublist-container{display:flex;flex-direction:column;gap:12px;margin-top:8px}",
     ".sub-item{background:var(--bg);border:1px solid var(--bor);border-radius:8px;padding:12px}",
-    ".sub-item-header{display:flex;gap:10px;align-items:center;margin-bottom:8px;flex-wrap:wrap}",
-    ".sub-item .sub-name{flex:1;min-width:120px;background:transparent;border:1px solid var(--bor);border-radius:6px;color:var(--tx);padding:6px 10px;font-size:.85rem}",
-    ".sub-item .sub-token-input{flex:1;min-width:150px;background:transparent;border:1px solid var(--bor);border-radius:6px;color:var(--b);padding:6px 10px;font-size:.82rem;font-family:monospace}",
+    ".sub-item-header{display:flex;gap:10px;align-items:flex-start;margin-bottom:8px;flex-wrap:wrap}",
+    ".sub-item .sub-name{flex:1;min-width:100px;background:transparent;border:1px solid var(--bor);border-radius:6px;color:var(--tx);padding:6px 10px;font-size:.85rem}",
+    ".sub-item .sub-token-input{flex:1;min-width:130px;background:transparent;border:1px solid var(--bor);border-radius:6px;color:var(--b);padding:6px 10px;font-size:.82rem;font-family:monospace}",
+    ".sub-item .sub-expiry-input{flex:0.8;min-width:120px;background:transparent;border:1px solid var(--bor);border-radius:6px;color:var(--tx);padding:6px 10px;font-size:.82rem;color-scheme:dark}",
     ".sub-item .sub-actions{display:flex;gap:4px;flex-wrap:wrap}",
     ".sub-item .sub-actions button{background:transparent;border:none;color:var(--mu);cursor:pointer;padding:4px 8px;font-size:.8rem;border-radius:4px}",
     ".sub-item .sub-actions button:hover{background:var(--bor);color:var(--tx)}",
     ".sub-item .sub-actions .del:hover{color:var(--red)}",
+    ".sub-item .sub-expiry-status{font-size:.72rem;padding:2px 8px;border-radius:4px;white-space:nowrap}",
+    ".sub-item .sub-expiry-status.active{background:rgba(93,231,180,.1);color:var(--b)}",
+    ".sub-item .sub-expiry-status.expired{background:rgba(245,110,110,.1);color:var(--red)}",
+    ".sub-item .sub-expiry-status.none{background:rgba(107,112,151,.08);color:var(--mu)}",
+    ".sub-item .sub-expiry-status.warning{background:rgba(245,166,35,.1);color:var(--warn)}",
     ".sub-item .node-select-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:6px;margin-top:8px}",
     ".sub-item .node-select-item{display:flex;align-items:center;gap:6px;font-size:.82rem;padding:4px 8px;background:rgba(255,255,255,.03);border-radius:4px}",
     ".sub-item .node-select-item input[type=checkbox]{accent-color:var(--a);cursor:pointer}",
@@ -406,6 +461,13 @@ function handleAdmin(origin) {
     ".warning-text{color:var(--warn);font-size:.75rem}",
     ".status-ok{color:var(--b)}",
     ".status-warn{color:var(--warn)}",
+    ".sub-item .sub-expiry-row{display:flex;gap:8px;align-items:center;flex:1;min-width:200px}",
+    ".sub-item .sub-traffic-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:6px}",
+    ".sub-item .sub-traffic-grid input{background:transparent;border:1px solid var(--bor);border-radius:6px;color:var(--tx);padding:4px 8px;font-size:.78rem;width:100%}",
+    ".sub-item .sub-traffic-grid input::placeholder{color:var(--mu)}",
+    ".info-text{color:var(--mu);font-size:.75rem;font-weight:400}",
+    ".traffic-label{font-size:.7rem;color:var(--mu);margin-bottom:2px;display:block}",
+    ".sub-item .sub-traffic-section{margin-top:6px;padding-top:6px;border-top:1px solid var(--bor)}",
     "#toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#22253a;border:1px solid var(--bor);color:var(--tx);padding:10px 22px;border-radius:20px;font-size:.88rem;opacity:0;transition:opacity .25s;pointer-events:none;white-space:nowrap;z-index:999}",
     "#toast.on{opacity:1}"
   ].join("\n");
@@ -620,7 +682,34 @@ function handleAdmin(origin) {
     "  return t;",
     "}",
 
-    "function addSubItem(id, name, token, selectedIndices){",
+    "function updateExpiryStatus(input){",
+    "  var item=input.closest('.sub-item');",
+    "  var statusSpan=item.querySelector('.sub-expiry-status');",
+    "  var val=input.value.trim();",
+    "  if(!val){",
+    "    statusSpan.className='sub-expiry-status none';",
+    "    statusSpan.textContent='永久有效';",
+    "    return;",
+    "  }",
+    "  var now=new Date();now.setHours(0,0,0,0);",
+    "  var exp=new Date(val);exp.setHours(0,0,0,0);",
+    "  var diff=Math.round((exp-now)/(86400000));",
+    "  if(diff<0){",
+    "    statusSpan.className='sub-expiry-status expired';",
+    "    statusSpan.textContent='已过期 '+(diff*-1)+' 天';",
+    "  }else if(diff===0){",
+    "    statusSpan.className='sub-expiry-status warning';",
+    "    statusSpan.textContent='今天到期';",
+    "  }else if(diff<=7){",
+    "    statusSpan.className='sub-expiry-status warning';",
+    "    statusSpan.textContent=diff+' 天后到期';",
+    "  }else{",
+    "    statusSpan.className='sub-expiry-status active';",
+    "    statusSpan.textContent=diff+' 天后到期';",
+    "  }",
+    "}",
+
+    "function addSubItem(id, name, token, selectedIndices, expiry, traffic){",
     "  var container=document.getElementById('sublist-container');",
     "  var div=document.createElement('div');",
     "  div.className='sub-item';",
@@ -639,12 +728,36 @@ function handleAdmin(origin) {
     "  var subToken=token||genRandomToken(24);",
     "  var baseUrl='" + subUrl + "';",
     "  var fullUrl=baseUrl+'?token='+subToken;",
+    "  var expiryVal=expiry||'';",
+    "  var statusText='永久有效';",
+    "  var statusClass='none';",
+    "  if(expiryVal){",
+    "    var now=new Date();now.setHours(0,0,0,0);",
+    "    var exp=new Date(expiryVal);exp.setHours(0,0,0,0);",
+    "    var diff=Math.round((exp-now)/(86400000));",
+    "    if(diff<0){statusText='已过期 '+(diff*-1)+' 天';statusClass='expired';}",
+    "    else if(diff===0){statusText='今天到期';statusClass='warning';}",
+    "    else if(diff<=7){statusText=diff+' 天后到期';statusClass='warning';}",
+    "    else{statusText=diff+' 天后到期';statusClass='active';}",
+    "  }",
+    "  var t=traffic||{};",
     "  div.innerHTML='<div class=\"sub-item-header\">'",
     "    +'<input class=\"sub-name\" type=\"text\" placeholder=\"订阅名称\" value=\"'+escapeHtml(name||'')+'\">'",
     "    +'<input class=\"sub-token-input\" type=\"text\" placeholder=\"Token（自定义）\" value=\"'+subToken+'\" oninput=\"updateSubUrlFromInput(this)\">'",
+    "    +'<div class=\"sub-expiry-row\">'",
+    "    +'<input class=\"sub-expiry-input\" type=\"date\" value=\"'+expiryVal+'\" oninput=\"updateExpiryStatus(this)\">'",
+    "    +'<span class=\"sub-expiry-status '+statusClass+'\">'+statusText+'</span>'",
+    "    +'</div>'",
     "    +'<div class=\"sub-actions\">'",
     "    +'<button onclick=\"genTokenForSub(this)\" class=\"gen-token-btn\" title=\"生成随机 Token\">🎲</button>'",
     "    +'<button onclick=\"deleteSub(this)\" class=\"del\" title=\"删除\">✕</button>'",
+    "    +'</div>'",
+    "    +'</div>'",
+    "    +'<div class=\"sub-traffic-section\">'",
+    "    +'<div class=\"sub-traffic-grid\">'",
+    "    +'<div><span class=\"traffic-label\">已上传</span><input class=\"sub-traffic-upload\" type=\"text\" placeholder=\"例如 53G\" value=\"'+escapeHtml(t.upload||'')+'\"></div>'",
+    "    +'<div><span class=\"traffic-label\">已下载</span><input class=\"sub-traffic-download\" type=\"text\" placeholder=\"例如 93G\" value=\"'+escapeHtml(t.download||'')+'\"></div>'",
+    "    +'<div><span class=\"traffic-label\">总流量</span><input class=\"sub-traffic-total\" type=\"text\" placeholder=\"例如 5T\" value=\"'+escapeHtml(t.total||'')+'\"></div>'",
     "    +'</div>'",
     "    +'</div>'",
     "    +'<div class=\"node-select-grid\">'+checkboxesHtml+'</div>'",
@@ -695,6 +808,10 @@ function handleAdmin(origin) {
     "    var id=item.dataset.id;",
     "    var name=item.querySelector('.sub-name').value.trim();",
     "    var token=item.querySelector('.sub-token-input').value.trim();",
+    "    var expiry=item.querySelector('.sub-expiry-input').value.trim();",
+    "    var upload=item.querySelector('.sub-traffic-upload').value.trim();",
+    "    var download=item.querySelector('.sub-traffic-download').value.trim();",
+    "    var total=item.querySelector('.sub-traffic-total').value.trim();",
     "    if(!token){",
     "      toast('订阅 \"'+(name||'未命名')+'\" 缺少 Token',true);",
     "      hasError=true;",
@@ -710,7 +827,14 @@ function handleAdmin(origin) {
     "    checkboxes.forEach(function(cb){",
     "      if(cb.checked)selectedIndices.push(parseInt(cb.value));",
     "    });",
-    "    data.push({id:id,name:name,token:token,selectedIndices:selectedIndices});",
+    "    var traffic={};",
+    "    if(upload) traffic.upload=upload;",
+    "    if(download) traffic.download=download;",
+    "    if(total) traffic.total=total;",
+    "    var subData={id:id,name:name,token:token,selectedIndices:selectedIndices};",
+    "    if(expiry) subData.expiry=expiry;",
+    "    if(Object.keys(traffic).length>0) subData.traffic=traffic;",
+    "    data.push(subData);",
     "  });",
     "  if(hasError) return null;",
     "  return data;",
@@ -733,7 +857,7 @@ function handleAdmin(origin) {
     "    var container=document.getElementById('sublist-container');",
     "    container.innerHTML='';",
     "    (d.sublist||[]).forEach(function(item){",
-    "      addSubItem(item.id, item.name, item.token, item.selectedIndices||[]);",
+    "      addSubItem(item.id, item.name, item.token, item.selectedIndices||[], item.expiry||'', item.traffic||{});",
     "    });",
     "  }catch(e){toast('加载订阅列表失败',true);}",
     "}",
@@ -854,7 +978,7 @@ function handleAdmin(origin) {
     "  var items=document.querySelectorAll('.node-item');",
     "  var allIndices=[];",
     "  for(var i=0;i<items.length;i++)allIndices.push(i);",
-    "  addSubItem(null,'新订阅',null,allIndices);",
+    "  addSubItem(null,'新订阅',null,allIndices,'',{});",
     "});",
     "document.getElementById('gen-global-token').addEventListener('click',genGlobalToken);"
   ].join("\n");
@@ -896,7 +1020,7 @@ function handleAdmin(origin) {
     "    </div>",
 
     "    <div class=\"card\">",
-    "      <div class=\"label\">自定义订阅列表 <span style=\"color:var(--mu);font-weight:400;text-transform:none;font-size:.75rem\">（每个订阅通过不同的 Token 访问）</span></div>",
+    "      <div class=\"label\">自定义订阅列表 <span style=\"color:var(--mu);font-weight:400;text-transform:none;font-size:.75rem\">（每个订阅通过不同的 Token 访问，可单独设置过期时间和流量）</span></div>",
     "      <div id=\"sublist-container\" class=\"sublist-container\">",
     "      </div>",
     "      <div id=\"add-sub-btn\" class=\"add-sub-btn\">＋ 添加自定义订阅</div>",
@@ -927,7 +1051,7 @@ function handleAdmin(origin) {
     "    </div>",
 
     "    <div class=\"card\">",
-    "      <div class=\"label\">订阅信息（Shadowrocket 显示内容）</div>",
+    "      <div class=\"label\">全局订阅信息（Shadowrocket 显示内容）<span class=\"info-text\">（自定义订阅可单独设置，会覆盖全局设置）</span></div>",
     "      <div class=\"field\" style=\"margin-bottom:12px\">",
     "        <label>到期时间</label>",
     "        <div class=\"row\">",
@@ -973,7 +1097,8 @@ function handleAdmin(origin) {
     "    • <strong>未设置主 Token</strong>：访问 <code>/sub</code> 返回所有启用节点（公开）<br>",
     "    • <strong>已设置主 Token</strong>：访问 <code>/sub</code> 会提示 <code>Missing token parameter</code>，必须使用 <code>/sub?token=主Token</code><br>",
     "    • <strong>自定义订阅</strong>：始终需要 Token 访问，格式为 <code>/sub?token=自定义Token</code><br>",
-    "    • <strong>Token 冲突</strong>：主 Token 和自定义 Token 不能相同</div>",
+    "    • <strong>到期时间</strong>：自定义订阅可单独设置到期时间，过期后访问返回 <code>Subscription expired</code><br>",
+    "    • <strong>流量信息</strong>：自定义订阅可单独设置流量（上传/下载/总量），在 <code>Subscription-Userinfo</code> 头中显示</div>",
     "  </div>",
     "</div>",
     "<div id=\"toast\"></div>",
