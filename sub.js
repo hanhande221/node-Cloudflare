@@ -3,6 +3,7 @@ const KV_EXPIRY = "expiry";
 const KV_TRAFFIC = "traffic";
 const KV_SUBNAME = "subname";
 const KV_SUBTOKEN = "subtoken";
+const KV_SUBLIST = "sublist"; // 存储自定义订阅列表
 
 export default {
   async fetch(request, env) {
@@ -21,6 +22,8 @@ export default {
     if (path === "/api/settraffic" && method === "POST") return handleSetTraffic(request, env);
     if (path === "/api/getsubinfo" && method === "GET") return handleGetSubInfo(request, env);
     if (path === "/api/setsubinfo" && method === "POST") return handleSetSubInfo(request, env);
+    if (path === "/api/getsublist" && method === "GET") return handleGetSubList(request, env);
+    if (path === "/api/savesublist" && method === "POST") return handleSaveSubList(request, env);
 
     return new Response("Not Found", { status: 404 });
   }
@@ -69,8 +72,21 @@ async function handleSave(request, env) {
   if (!authed(request)) return err("unauthorized", 401);
   let body;
   try { body = await request.json(); } catch { return err("bad request"); }
-  const nodes = (body.nodes || []).map(s => s.trim()).filter(Boolean);
-  await env.KV.put(KV_KEY, JSON.stringify(nodes));
+  const nodes = body.nodes || [];
+  const formattedNodes = nodes.map(item => {
+    if (typeof item === 'string') {
+      return { url: item.trim(), remark: '', enabled: true };
+    } else if (typeof item === 'object' && item !== null) {
+      return { 
+        url: (item.url || '').trim(), 
+        remark: (item.remark || '').trim(),
+        enabled: item.enabled !== undefined ? item.enabled : true
+      };
+    }
+    return null;
+  }).filter(item => item && item.url);
+  
+  await env.KV.put(KV_KEY, JSON.stringify(formattedNodes));
   return ok({ ok: true });
 }
 
@@ -110,7 +126,6 @@ async function handleSetTraffic(request, env) {
   return ok({ ok: true });
 }
 
-// 新增：获取订阅备注名 + token
 async function handleGetSubInfo(request, env) {
   if (!authed(request)) return err("unauthorized", 401);
   const subname = await env.KV.get(KV_SUBNAME) || "";
@@ -118,7 +133,6 @@ async function handleGetSubInfo(request, env) {
   return ok({ subname, subtoken });
 }
 
-// 新增：保存订阅备注名 + token
 async function handleSetSubInfo(request, env) {
   if (!authed(request)) return err("unauthorized", 401);
   let body;
@@ -130,7 +144,22 @@ async function handleSetSubInfo(request, env) {
   return ok({ ok: true });
 }
 
-// 把 "53G" / "1.5T" / "512M" 这类字符串转成字节数
+async function handleGetSubList(request, env) {
+  if (!authed(request)) return err("unauthorized", 401);
+  let sublist = [];
+  try { sublist = JSON.parse(await env.KV.get(KV_SUBLIST) || "[]"); } catch {}
+  return ok({ sublist });
+}
+
+async function handleSaveSubList(request, env) {
+  if (!authed(request)) return err("unauthorized", 401);
+  let body;
+  try { body = await request.json(); } catch { return err("bad request"); }
+  const sublist = body.sublist || [];
+  await env.KV.put(KV_SUBLIST, JSON.stringify(sublist));
+  return ok({ ok: true });
+}
+
 function parseBytes(str) {
   if (!str) return 0;
   str = str.trim().toUpperCase();
@@ -142,20 +171,42 @@ function parseBytes(str) {
 }
 
 async function handleSub(request, env, url) {
-  // Token 校验
-  const storedToken = await env.KV.get(KV_SUBTOKEN) || "";
-  if (storedToken) {
-    const reqToken = url.searchParams.get("token") || "";
-    if (reqToken !== storedToken) {
-      return new Response("Forbidden", { status: 403 });
-    }
+  const reqToken = url.searchParams.get("token") || "";
+  
+  // 如果没有 token，返回主订阅
+  if (!reqToken) {
+    return handleMainSub(request, env, url);
   }
+  
+  // 检查是否是全局 Token（管理后台设置的）
+  const globalToken = await env.KV.get(KV_SUBTOKEN) || "";
+  if (reqToken === globalToken) {
+    return handleMainSub(request, env, url);
+  }
+  
+  // 查找自定义订阅
+  let sublist = [];
+  try { sublist = JSON.parse(await env.KV.get(KV_SUBLIST) || "[]"); } catch {}
+  
+  const subConfig = sublist.find(s => s.token === reqToken);
+  if (!subConfig) {
+    return new Response("Invalid token", { status: 403 });
+  }
+  
+  return handleCustomSub(request, env, url, subConfig);
+}
 
+async function handleMainSub(request, env, url) {
   let raw = [];
   try { raw = JSON.parse(await env.KV.get(KV_KEY) || "[]"); } catch {}
 
   const out = [];
-  await Promise.all(raw.map(async line => {
+  await Promise.all(raw.map(async item => {
+    if (item.enabled === false) return;
+    
+    const line = typeof item === 'string' ? item : item.url;
+    if (!line) return;
+    
     if (line.startsWith("http://") || line.startsWith("https://")) {
       try {
         let text = await fetch(line).then(r => r.text());
@@ -173,15 +224,49 @@ async function handleSub(request, env, url) {
     }
   }));
 
+  return buildSubResponse(out, env);
+}
+
+async function handleCustomSub(request, env, url, subConfig) {
+  let raw = [];
+  try { raw = JSON.parse(await env.KV.get(KV_KEY) || "[]"); } catch {}
+
+  const selectedIndices = new Set(subConfig.selectedIndices || []);
+  
+  const out = [];
+  await Promise.all(raw.map(async (item, index) => {
+    if (!selectedIndices.has(index)) return;
+    if (item.enabled === false) return;
+    
+    const line = typeof item === 'string' ? item : item.url;
+    if (!line) return;
+    
+    if (line.startsWith("http://") || line.startsWith("https://")) {
+      try {
+        let text = await fetch(line).then(r => r.text());
+        const clean = text.trim().replace(/\s/g, "");
+        if (/^[A-Za-z0-9+/]+=*$/.test(clean)) {
+          try { text = decodeURIComponent(escape(atob(clean))); } catch {}
+        }
+        text.split("\n").forEach(l => {
+          l = l.trim();
+          if (l && !l.startsWith("#") && !l.includes("EXPIRE")) out.push(l);
+        });
+      } catch {}
+    } else if (line.trim()) {
+      out.push(line.trim());
+    }
+  }));
+
+  return buildSubResponse(out, env);
+}
+
+async function buildSubResponse(out, env) {
   const encoded = btoa(unescape(encodeURIComponent(out.join("\n"))));
 
   const expiryStr = await env.KV.get(KV_EXPIRY) || "";
   let trafficObj = { upload: "", download: "", total: "" };
   try { trafficObj = JSON.parse(await env.KV.get(KV_TRAFFIC) || "{}"); } catch {}
-
-  // 订阅备注名
-  const subname = await env.KV.get(KV_SUBNAME) || "";
-  const filename = subname ? encodeURIComponent(subname) + ".txt" : "sub.txt";
 
   const parts = [];
   if (trafficObj.upload)   parts.push("upload="   + parseBytes(trafficObj.upload));
@@ -189,13 +274,16 @@ async function handleSub(request, env, url) {
   if (trafficObj.total)    parts.push("total="    + parseBytes(trafficObj.total));
   if (expiryStr)           parts.push("expire="   + Math.floor(new Date(expiryStr).getTime() / 1000));
 
+  const subname = await env.KV.get(KV_SUBNAME) || "";
+  
   const headers = {
     "Content-Type": "text/plain; charset=utf-8",
     "Profile-Update-Interval": "24",
-    "Content-Disposition": "attachment; filename*=UTF-8''" + filename
+    "Subscription-Userinfo": parts.join("; ")
   };
-  if (parts.length > 0) {
-    headers["Subscription-Userinfo"] = parts.join("; ");
+  
+  if (subname) {
+    headers["Profile-Title"] = subname;
   }
 
   return new Response(encoded, { headers });
@@ -208,13 +296,13 @@ function handleAdmin(origin) {
     "*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}",
     ":root{--bg:#0d0e14;--sur:#13151e;--bor:#1f2130;--a:#7c6ef5;--b:#5de7b4;--tx:#dde1f0;--mu:#6b7097;--red:#f56e6e;--warn:#f5a623;--r:12px}",
     "body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}",
-    ".wrap{width:100%;max-width:740px}",
+    ".wrap{width:100%;max-width:960px}",
     ".hd{text-align:center;margin-bottom:32px}",
     ".hd h1{font-size:1.7rem;font-weight:700;background:linear-gradient(135deg,var(--a),var(--b));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}",
     ".hd p{color:var(--mu);margin-top:6px;font-size:.9rem}",
     ".card{background:var(--sur);border:1px solid var(--bor);border-radius:var(--r);padding:24px;margin-bottom:16px}",
     ".label{font-size:.75rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--mu);margin-bottom:14px}",
-    ".row{display:flex;gap:10px;align-items:center}",
+    ".row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}",
     ".grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px}",
     ".grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}",
     ".field label{font-size:.75rem;color:var(--mu);display:block;margin-bottom:4px}",
@@ -229,12 +317,28 @@ function handleAdmin(origin) {
     ".sm{padding:6px 12px;font-size:.82rem}",
     ".subbox{display:flex;align-items:center;gap:10px;background:var(--bg);border:1px solid var(--bor);border-radius:8px;padding:10px 14px}",
     ".suburl{flex:1;font-family:monospace;font-size:.88rem;color:var(--b);word-break:break-all}",
-    "textarea{width:100%;background:var(--bg);border:1px solid var(--bor);border-radius:8px;color:var(--tx);padding:12px 14px;font-family:monospace;font-size:.85rem;line-height:1.6;height:300px;resize:vertical;outline:none;transition:border-color .2s}",
-    "textarea:focus{border-color:var(--a)}",
+    ".nodes-container{display:flex;flex-direction:column;gap:8px;margin-top:8px}",
+    ".node-item{display:flex;gap:8px;align-items:center;background:var(--bg);border:1px solid var(--bor);border-radius:8px;padding:8px 12px}",
+    ".node-item.disabled{opacity:0.5;border-color:var(--mu)}",
+    ".node-toggle{flex-shrink:0;width:36px;height:20px;background:var(--bor);border-radius:10px;cursor:pointer;position:relative;transition:background .3s;border:none;padding:0}",
+    ".node-toggle.active{background:var(--a)}",
+    ".node-toggle::after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;background:#fff;border-radius:50%;transition:transform .3s}",
+    ".node-toggle.active::after{transform:translateX(16px)}",
+    ".node-url{flex:2;background:transparent;border:none;color:var(--tx);font-family:monospace;font-size:.82rem;padding:6px;outline:none;min-width:0}",
+    ".node-remark{flex:1;background:transparent;border:none;color:var(--mu);font-size:.82rem;padding:6px;outline:none;border-left:1px solid var(--bor);padding-left:12px;min-width:0}",
+    ".node-url:focus,.node-remark:focus{color:var(--tx)}",
+    ".node-actions{display:flex;gap:4px;flex-shrink:0}",
+    ".node-actions button{background:transparent;border:none;color:var(--mu);cursor:pointer;padding:4px 8px;font-size:.8rem;border-radius:4px}",
+    ".node-actions button:hover{background:var(--bor);color:var(--tx)}",
+    ".node-actions .del:hover{color:var(--red)}",
+    ".add-node-btn{background:var(--bg);border:1px dashed var(--bor);border-radius:8px;padding:10px;color:var(--mu);cursor:pointer;text-align:center;font-size:.85rem;transition:all .2s}",
+    ".add-node-btn:hover{border-color:var(--a);color:var(--a)}",
     ".foot{display:flex;align-items:center;justify-content:space-between;margin-top:12px;gap:10px;flex-wrap:wrap}",
-    ".stats{display:flex;gap:16px}",
+    ".stats{display:flex;gap:16px;flex-wrap:wrap}",
     ".stat{font-size:.82rem;color:var(--mu)}",
     ".stat b{color:var(--tx);font-weight:600}",
+    ".stat .enabled-count{color:var(--b)}",
+    ".stat .disabled-count{color:var(--mu)}",
     ".preview{background:var(--bg);border:1px solid var(--bor);border-radius:8px;padding:10px 14px;font-size:.82rem;color:var(--mu);margin-top:12px;font-family:monospace;min-height:36px}",
     ".preview span{color:var(--b)}",
     ".tip{background:rgba(124,110,245,.08);border:1px solid rgba(124,110,245,.2);border-radius:8px;padding:12px 14px;font-size:.82rem;color:var(--mu);line-height:1.8}",
@@ -246,6 +350,29 @@ function handleAdmin(origin) {
     ".expiry-none{background:rgba(107,112,151,.08);border:1px solid var(--bor);color:var(--mu)}",
     ".token-badge{display:inline-flex;align-items:center;gap:6px;background:rgba(93,231,180,.08);border:1px solid rgba(93,231,180,.2);border-radius:6px;padding:4px 10px;font-size:.78rem;color:var(--b);margin-top:8px}",
     ".token-none{background:rgba(107,112,151,.08);border-color:var(--bor);color:var(--mu)}",
+    ".sublist-container{display:flex;flex-direction:column;gap:12px;margin-top:8px}",
+    ".sub-item{background:var(--bg);border:1px solid var(--bor);border-radius:8px;padding:12px}",
+    ".sub-item-header{display:flex;gap:10px;align-items:center;margin-bottom:8px;flex-wrap:wrap}",
+    ".sub-item input[type=text]{flex:1;min-width:150px;background:transparent;border:1px solid var(--bor);border-radius:6px;color:var(--tx);padding:6px 10px;font-size:.85rem}",
+    ".sub-item .sub-token{color:var(--b);font-family:monospace;font-size:.78rem;padding:4px 8px;background:rgba(93,231,180,.08);border-radius:4px;word-break:break-all}",
+    ".sub-item .sub-actions{display:flex;gap:4px;flex-wrap:wrap}",
+    ".sub-item .sub-actions button{background:transparent;border:none;color:var(--mu);cursor:pointer;padding:4px 8px;font-size:.8rem;border-radius:4px}",
+    ".sub-item .sub-actions button:hover{background:var(--bor);color:var(--tx)}",
+    ".sub-item .sub-actions .del:hover{color:var(--red)}",
+    ".sub-item .node-select-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:6px;margin-top:8px}",
+    ".sub-item .node-select-item{display:flex;align-items:center;gap:6px;font-size:.82rem;padding:4px 8px;background:rgba(255,255,255,.03);border-radius:4px}",
+    ".sub-item .node-select-item input[type=checkbox]{accent-color:var(--a);cursor:pointer}",
+    ".sub-item .node-select-item label{cursor:pointer;color:var(--tx);flex:1}",
+    ".sub-item .node-select-item .node-idx{color:var(--mu);font-size:.7rem;margin-right:4px}",
+    ".add-sub-btn{background:var(--bg);border:1px dashed var(--bor);border-radius:8px;padding:10px;color:var(--mu);cursor:pointer;text-align:center;font-size:.85rem;transition:all .2s;margin-top:8px}",
+    ".add-sub-btn:hover{border-color:var(--a);color:var(--a)}",
+    ".sub-url-box{display:flex;gap:8px;align-items:center;background:rgba(124,110,245,.05);border:1px solid rgba(124,110,245,.15);border-radius:6px;padding:4px 8px;margin-top:8px}",
+    ".sub-url-box .sub-url{flex:1;font-family:monospace;font-size:.78rem;color:var(--b);word-break:break-all}",
+    ".sub-url-box .copy-btn{background:transparent;border:none;color:var(--mu);cursor:pointer;font-size:.75rem;padding:2px 8px;border-radius:4px}",
+    ".sub-url-box .copy-btn:hover{background:rgba(255,255,255,.05);color:var(--tx)}",
+    ".sub-item .sub-name{color:var(--tx);font-weight:500}",
+    ".regenerate-btn{color:var(--b) !important}",
+    ".regenerate-btn:hover{background:rgba(93,231,180,.1) !important}",
     "#toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#22253a;border:1px solid var(--bor);color:var(--tx);padding:10px 22px;border-radius:20px;font-size:.88rem;opacity:0;transition:opacity .25s;pointer-events:none;white-space:nowrap;z-index:999}",
     "#toast.on{opacity:1}"
   ].join("\n");
@@ -262,12 +389,70 @@ function handleAdmin(origin) {
     "}",
 
     "function stat(){",
-    "  var v=document.getElementById('ta').value;",
-    "  var ls=v.split('\\n').map(function(x){return x.trim();}).filter(Boolean);",
-    "  var u=ls.filter(function(x){return x.indexOf('http')=== 0;});",
-    "  document.getElementById('s1').textContent=ls.length;",
-    "  document.getElementById('s2').textContent=u.length;",
-    "  document.getElementById('s3').textContent=ls.length-u.length;",
+    "  var items=document.querySelectorAll('.node-item');",
+    "  var total=items.length;",
+    "  var enabled=0,disabled=0,subs=0,nodes=0;",
+    "  items.forEach(function(item){",
+    "    var url=item.querySelector('.node-url').value;",
+    "    var isEnabled=item.dataset.enabled !== 'false';",
+    "    if(isEnabled)enabled++;else disabled++;",
+    "    if(url.startsWith('http://')||url.startsWith('https://'))subs++;else nodes++;",
+    "  });",
+    "  document.getElementById('s1').textContent=total;",
+    "  document.getElementById('s2').textContent=subs;",
+    "  document.getElementById('s3').textContent=nodes;",
+    "  document.getElementById('s4').textContent=enabled;",
+    "  document.getElementById('s5').textContent=disabled;",
+    "}",
+
+    "function toggleNode(btn){",
+    "  var item=btn.closest('.node-item');",
+    "  var isEnabled=item.dataset.enabled !== 'false';",
+    "  item.dataset.enabled=isEnabled?'false':'true';",
+    "  btn.classList.toggle('active');",
+    "  item.classList.toggle('disabled');",
+    "  stat();",
+    "  updateSubList();",
+    "}",
+
+    "function addNodeRow(url, remark, enabled){",
+    "  var container=document.getElementById('nodes-container');",
+    "  var div=document.createElement('div');",
+    "  div.className='node-item'+(enabled===false?' disabled':'');",
+    "  div.dataset.enabled=enabled!==false?'true':'false';",
+    "  div.innerHTML='<button class=\"node-toggle'+(enabled!==false?' active':'')+'\" onclick=\"toggleNode(this)\"></button>'",
+    "    +'<input class=\"node-url\" type=\"text\" placeholder=\"vmess:// 或 http://...\" value=\"'+escapeHtml(url||'')+'\">'",
+    "    +'<input class=\"node-remark\" type=\"text\" placeholder=\"备注（可选）\" value=\"'+escapeHtml(remark||'')+'\">'",
+    "    +'<div class=\"node-actions\">'",
+    "    +'<button onclick=\"moveNodeUp(this)\" title=\"上移\">↑</button>'",
+    "    +'<button onclick=\"moveNodeDown(this)\" title=\"下移\">↓</button>'",
+    "    +'<button class=\"del\" onclick=\"deleteNode(this)\" title=\"删除\">✕</button>'",
+    "    +'</div>';",
+    "  container.appendChild(div);",
+    "  stat();",
+    "  updateSubList();",
+    "}",
+
+    "function escapeHtml(str){",
+    "  if(!str)return '';",
+    "  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');",
+    "}",
+
+    "function deleteNode(btn){",
+    "  var item=btn.closest('.node-item');",
+    "  if(item){item.remove();stat();updateSubList();}",
+    "}",
+
+    "function moveNodeUp(btn){",
+    "  var item=btn.closest('.node-item');",
+    "  var prev=item.previousElementSibling;",
+    "  if(prev){item.parentNode.insertBefore(item,prev);stat();updateSubList();}",
+    "}",
+
+    "function moveNodeDown(btn){",
+    "  var item=btn.closest('.node-item');",
+    "  var next=item.nextElementSibling;",
+    "  if(next){item.parentNode.insertBefore(next,item);stat();updateSubList();}",
     "}",
 
     "function parseBytes(str){",
@@ -319,7 +504,6 @@ function handleAdmin(origin) {
     "  else{bar.className='expiry-bar expiry-ok';bar.textContent='✓ 域名有效，距到期还有 '+diff+' 天（'+dateStr+'）';}",
     "}",
 
-    // 更新订阅地址显示（含 token）
     "function updateSubUrl(){",
     "  var tok=document.getElementById('inp-token').value.trim();",
     "  var base='" + subUrl + "';",
@@ -331,6 +515,164 @@ function handleAdmin(origin) {
     "  else{badge.className='token-badge token-none';badge.textContent='🔓 未启用 Token（订阅链接公开可访问）';}",
     "}",
 
+    "function getNodeLabels(){",
+    "  var items=document.querySelectorAll('.node-item');",
+    "  var labels=[];",
+    "  items.forEach(function(item){",
+    "    var url=item.querySelector('.node-url').value;",
+    "    var remark=item.querySelector('.node-remark').value;",
+    "    var label=remark || url.substring(0,30)+(url.length>30?'...':'');",
+    "    labels.push(label);",
+    "  });",
+    "  return labels;",
+    "}",
+
+    "function updateSubList(){",
+    "  var items=document.querySelectorAll('.node-item');",
+    "  var subItems=document.querySelectorAll('.sub-item');",
+    "  var labels=getNodeLabels();",
+    "  subItems.forEach(function(subItem){",
+    "    var container=subItem.querySelector('.node-select-grid');",
+    "    if(!container)return;",
+    "    var checkboxes=container.querySelectorAll('input[type=checkbox]');",
+    "    if(checkboxes.length!==items.length){",
+    "      rebuildSubSelect(container, items.length, labels);",
+    "    }else{",
+    "      checkboxes.forEach(function(cb,idx){",
+    "        var label=cb.closest('label');",
+    "        if(label && idx<labels.length){",
+    "          var textNode=label.childNodes[label.childNodes.length-1];",
+    "          if(textNode)textNode.textContent=labels[idx];",
+    "        }",
+    "      });",
+    "    }",
+    "  });",
+    "}",
+
+    "function rebuildSubSelect(container, count, labels){",
+    "  container.innerHTML='';",
+    "  for(var i=0;i<count;i++){",
+    "    var div=document.createElement('div');",
+    "    div.className='node-select-item';",
+    "    var cb=document.createElement('input');",
+    "    cb.type='checkbox';",
+    "    cb.value=i;",
+    "    cb.checked=true;",
+    "    var label=document.createElement('label');",
+    "    var idxSpan=document.createElement('span');",
+    "    idxSpan.className='node-idx';",
+    "    idxSpan.textContent='#'+(i+1);",
+    "    label.appendChild(idxSpan);",
+    "    var textNode=document.createTextNode(labels[i]||'（空）');",
+    "    label.appendChild(textNode);",
+    "    div.appendChild(cb);",
+    "    div.appendChild(label);",
+    "    container.appendChild(div);",
+    "  }",
+    "}",
+
+    "function genToken(length){",
+    "  var chars='ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678';",
+    "  var t='';for(var i=0;i<length;i++)t+=chars[Math.floor(Math.random()*chars.length)];",
+    "  return t;",
+    "}",
+
+    "function addSubItem(id, name, token, selectedIndices){",
+    "  var container=document.getElementById('sublist-container');",
+    "  var div=document.createElement('div');",
+    "  div.className='sub-item';",
+    "  div.dataset.id=id||Date.now()+'_'+Math.random().toString(36).substr(2,4);",
+    "  var items=document.querySelectorAll('.node-item');",
+    "  var labels=getNodeLabels();",
+    "  var checkboxesHtml='';",
+    "  var selSet=new Set(selectedIndices||[]);",
+    "  for(var i=0;i<items.length;i++){",
+    "    var checked=selSet.has(i);",
+    "    checkboxesHtml+='<div class=\"node-select-item\">'",
+    "      +'<input type=\"checkbox\" value=\"'+i+'\"'+(checked?' checked':'')+'>'",
+    "      +'<label><span class=\"node-idx\">#'+(i+1)+'</span>'+escapeHtml(labels[i]||'（空）')+'</label>'",
+    "      +'</div>';",
+    "  }",
+    "  var subId=div.dataset.id;",
+    "  var subToken=token||genToken(24);",
+    "  var baseUrl='" + subUrl + "';",
+    "  var fullUrl=baseUrl+'?token='+subToken;",
+    "  div.innerHTML='<div class=\"sub-item-header\">'",
+    "    +'<input type=\"text\" class=\"sub-name\" placeholder=\"订阅名称\" value=\"'+escapeHtml(name||'')+'\">'",
+    "    +'<span class=\"sub-token\">'+subToken+'</span>'",
+    "    +'<div class=\"sub-actions\">'",
+    "    +'<button onclick=\"regenerateToken(this)\" class=\"regenerate-btn\" title=\"重新生成 Token\">⟳</button>'",
+    "    +'<button onclick=\"deleteSub(this)\" class=\"del\" title=\"删除\">✕</button>'",
+    "    +'</div>'",
+    "    +'</div>'",
+    "    +'<div class=\"node-select-grid\">'+checkboxesHtml+'</div>'",
+    "    +'<div class=\"sub-url-box\">'",
+    "    +'<span class=\"sub-url\">'+fullUrl+'</span>'",
+    "    +'<button class=\"copy-btn\" onclick=\"copySubUrl(this)\">复制</button>'",
+    "    +'</div>';",
+    "  container.appendChild(div);",
+    "}",
+
+    "function deleteSub(btn){",
+    "  var item=btn.closest('.sub-item');",
+    "  if(item){item.remove();}",
+    "}",
+
+    "function regenerateToken(btn){",
+    "  var item=btn.closest('.sub-item');",
+    "  var tokenSpan=item.querySelector('.sub-token');",
+    "  var newToken=genToken(24);",
+    "  tokenSpan.textContent=newToken;",
+    "  var urlSpan=item.querySelector('.sub-url');",
+    "  var baseUrl='" + subUrl + "';",
+    "  urlSpan.textContent=baseUrl+'?token='+newToken;",
+    "  toast('Token 已重新生成 ✓');",
+    "}",
+
+    "function copySubUrl(btn){",
+    "  var url=btn.closest('.sub-url-box').querySelector('.sub-url').textContent;",
+    "  navigator.clipboard.writeText(url).then(function(){toast('已复制 ✓');});",
+    "}",
+
+    "function getSubListData(){",
+    "  var subItems=document.querySelectorAll('.sub-item');",
+    "  var data=[];",
+    "  subItems.forEach(function(item){",
+    "    var id=item.dataset.id;",
+    "    var name=item.querySelector('.sub-name').value.trim();",
+    "    var token=item.querySelector('.sub-token').textContent.trim();",
+    "    var checkboxes=item.querySelectorAll('.node-select-grid input[type=checkbox]');",
+    "    var selectedIndices=[];",
+    "    checkboxes.forEach(function(cb){",
+    "      if(cb.checked)selectedIndices.push(parseInt(cb.value));",
+    "    });",
+    "    if(name){",
+    "      data.push({id:id,name:name,token:token,selectedIndices:selectedIndices});",
+    "    }",
+    "  });",
+    "  return data;",
+    "}",
+
+    "async function saveSubList(){",
+    "  var data=getSubListData();",
+    "  try{",
+    "    await fetch('/api/savesublist',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sublist:data})});",
+    "    toast('订阅列表已保存 ✓');",
+    "  }catch(e){toast('保存失败',true);}",
+    "}",
+
+    "async function loadSubList(){",
+    "  try{",
+    "    var r=await fetch('/api/getsublist',{credentials:'include'});",
+    "    var d=await r.json();",
+    "    var container=document.getElementById('sublist-container');",
+    "    container.innerHTML='';",
+    "    (d.sublist||[]).forEach(function(item){",
+    "      addSubItem(item.id, item.name, item.token, item.selectedIndices||[]);",
+    "    });",
+    "  }catch(e){toast('加载订阅列表失败',true);}",
+    "}",
+
     "async function login(){",
     "  var pw=document.getElementById('pw').value;",
     "  if(!pw){toast('请输入密码',true);return;}",
@@ -340,18 +682,48 @@ function handleAdmin(origin) {
     "    if(d.ok){",
     "      document.getElementById('lbox').style.display='none';",
     "      document.getElementById('main').style.display='block';",
-    "      loadNodes();loadExpiry();loadTraffic();loadSubInfo();",
+    "      await loadNodes();",
+    "      await loadExpiry();",
+    "      await loadTraffic();",
+    "      await loadSubInfo();",
+    "      await loadSubList();",
     "    }else{toast('密码错误',true);document.getElementById('pw').value='';}",
     "  }catch(e){toast('网络错误',true);}",
     "}",
 
     "async function loadNodes(){",
-    "  try{var r=await fetch('/api/list',{credentials:'include'});var d=await r.json();document.getElementById('ta').value=d.nodes.join('\\n');stat();}catch(e){toast('加载失败',true);}",
+    "  try{",
+    "    var r=await fetch('/api/list',{credentials:'include'});",
+    "    var d=await r.json();",
+    "    var container=document.getElementById('nodes-container');",
+    "    container.innerHTML='';",
+    "    (d.nodes||[]).forEach(function(item){",
+    "      if(typeof item==='string'){",
+    "        addNodeRow(item,'',true);",
+    "      }else{",
+    "        addNodeRow(item.url||'',item.remark||'',item.enabled);",
+    "      }",
+    "    });",
+    "    stat();",
+    "    await loadSubList();",
+    "  }catch(e){toast('加载失败',true);}",
     "}",
 
     "async function saveNodes(){",
-    "  var nodes=document.getElementById('ta').value.split('\\n').map(function(x){return x.trim();}).filter(Boolean);",
-    "  try{await fetch('/api/save',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({nodes:nodes})});toast('保存成功 ✓');stat();}catch(e){toast('保存失败',true);}",
+    "  var items=document.querySelectorAll('.node-item');",
+    "  var nodes=[];",
+    "  items.forEach(function(item){",
+    "    var url=item.querySelector('.node-url').value.trim();",
+    "    var remark=item.querySelector('.node-remark').value.trim();",
+    "    var enabled=item.dataset.enabled !== 'false';",
+    "    if(url){",
+    "      nodes.push({url:url, remark:remark, enabled:enabled});",
+    "    }",
+    "  });",
+    "  try{",
+    "    await fetch('/api/save',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({nodes:nodes})});",
+    "    toast('保存成功 ✓');stat();",
+    "  }catch(e){toast('保存失败',true);}",
     "}",
 
     "async function loadExpiry(){",
@@ -374,7 +746,6 @@ function handleAdmin(origin) {
     "  try{var r=await fetch('/api/settraffic',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({traffic:traffic})});var d=await r.json();if(d.ok)toast('流量信息已保存 ✓');else toast('保存失败',true);}catch(e){toast('保存失败',true);}",
     "}",
 
-    // 新增：加载订阅备注名 + token
     "async function loadSubInfo(){",
     "  try{",
     "    var r=await fetch('/api/getsubinfo',{credentials:'include'});",
@@ -385,7 +756,6 @@ function handleAdmin(origin) {
     "  }catch(e){}",
     "}",
 
-    // 新增：保存订阅备注名 + token
     "async function saveSubInfo(){",
     "  var subname=document.getElementById('inp-subname').value.trim();",
     "  var subtoken=document.getElementById('inp-token').value.trim();",
@@ -402,21 +772,26 @@ function handleAdmin(origin) {
     "  navigator.clipboard.writeText(url).then(function(){toast('已复制 ✓');});",
     "}",
 
-    "function genToken(){",
-    "  var chars='ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678';",
-    "  var t='';for(var i=0;i<24;i++)t+=chars[Math.floor(Math.random()*chars.length)];",
-    "  document.getElementById('inp-token').value=t;",
+    "function genGlobalToken(){",
+    "  document.getElementById('inp-token').value=genToken(24);",
     "  updateSubUrl();",
     "}",
 
     "document.getElementById('pw').addEventListener('keydown',function(e){if(e.key==='Enter')login();});",
-    "document.getElementById('ta').addEventListener('input',stat);",
     "document.getElementById('t-up').addEventListener('input',updatePreview);",
     "document.getElementById('t-dl').addEventListener('input',updatePreview);",
     "document.getElementById('t-tot').addEventListener('input',updatePreview);",
     "document.getElementById('expiry-input').addEventListener('input',function(){renderExpiryBar(this.value);updatePreview();});",
     "document.getElementById('inp-token').addEventListener('input',updateSubUrl);",
-    "document.getElementById('inp-subname').addEventListener('input',updateSubUrl);"
+    "document.getElementById('inp-subname').addEventListener('input',updateSubUrl);",
+    "document.getElementById('add-node-btn').addEventListener('click',function(){addNodeRow('','',true);});",
+    "document.getElementById('add-sub-btn').addEventListener('click',function(){",
+    "  var items=document.querySelectorAll('.node-item');",
+    "  var allIndices=[];",
+    "  for(var i=0;i<items.length;i++)allIndices.push(i);",
+    "  addSubItem(null,'新订阅',null,allIndices);",
+    "});",
+    "document.getElementById('gen-global-token').addEventListener('click',genGlobalToken);"
   ].join("\n");
 
   const parts = [
@@ -425,7 +800,7 @@ function handleAdmin(origin) {
     "<head>",
     "<meta charset=\"UTF-8\">",
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
-    "<title>订阅管理</title>",
+    "<title>订阅管理器</title>",
     "<style>", style, "</style>",
     "</head>",
     "<body>",
@@ -442,9 +817,8 @@ function handleAdmin(origin) {
 
     "  <div id=\"main\" style=\"display:none\">",
 
-    // 订阅地址卡片（动态显示完整 URL）
     "    <div class=\"card\">",
-    "      <div class=\"label\">订阅地址</div>",
+    "      <div class=\"label\">主订阅地址（包含所有启用的节点）</div>",
     "      <div class=\"subbox\">",
     "        <div id=\"sub-url-display\" class=\"suburl\">" + subUrl + "</div>",
     "        <button class=\"btn pb sm\" onclick=\"copyUrl()\">复制</button>",
@@ -453,19 +827,29 @@ function handleAdmin(origin) {
     "      <div id=\"token-badge\" class=\"token-badge token-none\">🔓 未启用 Token（订阅链接公开可访问）</div>",
     "    </div>",
 
-    // 新增：订阅备注名 + Token 卡片
     "    <div class=\"card\">",
-    "      <div class=\"label\">订阅设置</div>",
+    "      <div class=\"label\">自定义订阅列表 <span style=\"color:var(--mu);font-weight:400;text-transform:none;font-size:.75rem\">（每个订阅通过不同的 Token 访问）</span></div>",
+    "      <div id=\"sublist-container\" class=\"sublist-container\">",
+    "      </div>",
+    "      <div id=\"add-sub-btn\" class=\"add-sub-btn\">＋ 添加自定义订阅</div>",
+    "      <div class=\"foot\" style=\"margin-top:12px\">",
+    "        <div></div>",
+    "        <button class=\"btn pa\" onclick=\"saveSubList()\">保存订阅列表</button>",
+    "      </div>",
+    "    </div>",
+
+    "    <div class=\"card\">",
+    "      <div class=\"label\">全局设置</div>",
     "      <div class=\"grid2\">",
     "        <div class=\"field\">",
     "          <label>订阅备注名（Shadowrocket 显示的名称）</label>",
     "          <input id=\"inp-subname\" type=\"text\" placeholder=\"例如：我的机场\">",
     "        </div>",
     "        <div class=\"field\">",
-    "          <label>访问 Token（留空则不启用保护）</label>",
+    "          <label>全局访问 Token（留空则不启用保护）</label>",
     "          <div class=\"row\">",
     "            <input id=\"inp-token\" type=\"text\" placeholder=\"留空表示公开访问\">",
-    "            <button class=\"btn pc sm\" onclick=\"genToken()\">随机</button>",
+    "            <button class=\"btn pc sm\" id=\"gen-global-token\">随机</button>",
     "          </div>",
     "        </div>",
     "      </div>",
@@ -474,7 +858,6 @@ function handleAdmin(origin) {
     "      </div>",
     "    </div>",
 
-    // 到期时间 + 流量卡片
     "    <div class=\"card\">",
     "      <div class=\"label\">订阅信息（Shadowrocket 显示内容）</div>",
     "      <div class=\"field\" style=\"margin-bottom:12px\">",
@@ -498,15 +881,18 @@ function handleAdmin(origin) {
     "      <div id=\"header-preview\" class=\"preview\">（未填写任何字段，不输出 header）</div>",
     "    </div>",
 
-    // 节点卡片
     "    <div class=\"card\">",
-    "      <div class=\"label\">节点 / 订阅链接</div>",
-    "      <textarea id=\"ta\" placeholder=\"每行一条&#10;订阅链接 (http/https) → 自动拉取展开&#10;vmess:// vless:// trojan:// ss:// → 直接透传\"></textarea>",
+    "      <div class=\"label\">节点 / 订阅链接 <span style=\"color:var(--mu);font-weight:400;text-transform:none;font-size:.75rem\">（开关控制是否在订阅中生成）</span></div>",
+    "      <div id=\"nodes-container\" class=\"nodes-container\">",
+    "      </div>",
+    "      <div id=\"add-node-btn\" class=\"add-node-btn\">＋ 添加节点或订阅链接</div>",
     "      <div class=\"foot\">",
     "        <div class=\"stats\">",
     "          <span class=\"stat\">共 <b id=\"s1\">0</b> 行</span>",
     "          <span class=\"stat\">订阅 <b id=\"s2\">0</b></span>",
     "          <span class=\"stat\">节点 <b id=\"s3\">0</b></span>",
+    "          <span class=\"stat\">启用 <b class=\"enabled-count\" id=\"s4\">0</b></span>",
+    "          <span class=\"stat\">禁用 <b class=\"disabled-count\" id=\"s5\">0</b></span>",
     "        </div>",
     "        <div class=\"row\">",
     "          <button class=\"btn pc sm\" onclick=\"loadNodes()\">↺ 刷新</button>",
@@ -515,7 +901,7 @@ function handleAdmin(origin) {
     "      </div>",
     "    </div>",
 
-    "    <div class=\"tip\"><strong>说明：</strong>每行一条。http/https 开头的订阅链接会在输出时自动拉取并展开节点；vmess/vless/trojan/ss 等协议链接直接透传；两种可混合使用。</div>",
+    "    <div class=\"tip\"><strong>说明：</strong>每个节点前面的开关控制是否在订阅中生成。http/https 开头的订阅链接会在输出时自动拉取并展开节点；vmess/vless/trojan/ss 等协议链接直接透传。自定义订阅通过 Token 区分，每个订阅可以自由选择要包含的节点。</div>",
     "  </div>",
     "</div>",
     "<div id=\"toast\"></div>",
