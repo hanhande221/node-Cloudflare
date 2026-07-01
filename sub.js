@@ -3,7 +3,7 @@ const KV_EXPIRY = "expiry";
 const KV_TRAFFIC = "traffic";
 const KV_SUBNAME = "subname";
 const KV_SUBTOKEN = "subtoken";
-const KV_SUBLIST = "sublist"; // 存储自定义订阅列表
+const KV_SUBLIST = "sublist";
 
 export default {
   async fetch(request, env) {
@@ -156,6 +156,26 @@ async function handleSaveSubList(request, env) {
   let body;
   try { body = await request.json(); } catch { return err("bad request"); }
   const sublist = body.sublist || [];
+  
+  // 如果列表为空，直接保存空数组
+  if (sublist.length === 0) {
+    await env.KV.put(KV_SUBLIST, JSON.stringify([]));
+    return ok({ ok: true });
+  }
+  
+  // 验证 token 不能重复
+  const tokens = new Set();
+  for (const item of sublist) {
+    if (!item.token || !item.token.trim()) {
+      return err("每个订阅必须有一个 Token", 400);
+    }
+    const token = item.token.trim();
+    if (tokens.has(token)) {
+      return err(`Token "${token}" 重复`, 400);
+    }
+    tokens.add(token);
+  }
+  
   await env.KV.put(KV_SUBLIST, JSON.stringify(sublist));
   return ok({ ok: true });
 }
@@ -173,27 +193,38 @@ function parseBytes(str) {
 async function handleSub(request, env, url) {
   const reqToken = url.searchParams.get("token") || "";
   
-  // 如果没有 token，返回主订阅
-  if (!reqToken) {
-    return handleMainSub(request, env, url);
-  }
+  // 获取主订阅 Token
+  const mainToken = await env.KV.get(KV_SUBTOKEN) || "";
   
-  // 检查是否是全局 Token（管理后台设置的）
-  const globalToken = await env.KV.get(KV_SUBTOKEN) || "";
-  if (reqToken === globalToken) {
-    return handleMainSub(request, env, url);
-  }
-  
-  // 查找自定义订阅
-  let sublist = [];
-  try { sublist = JSON.parse(await env.KV.get(KV_SUBLIST) || "[]"); } catch {}
-  
-  const subConfig = sublist.find(s => s.token === reqToken);
-  if (!subConfig) {
+  // 情况1: 提供了 token
+  if (reqToken) {
+    // 检查是否是主订阅 Token
+    if (mainToken && reqToken === mainToken) {
+      return handleMainSub(request, env, url);
+    }
+    
+    // 检查是否是自定义订阅
+    let sublist = [];
+    try { sublist = JSON.parse(await env.KV.get(KV_SUBLIST) || "[]"); } catch {}
+    const subConfig = sublist.find(s => s.token === reqToken);
+    if (subConfig) {
+      return handleCustomSub(request, env, url, subConfig);
+    }
+    
     return new Response("Invalid token", { status: 403 });
   }
   
-  return handleCustomSub(request, env, url, subConfig);
+  // 情况2: 没有提供 token
+  // 如果设置了主 Token，必须带 token 访问
+  if (mainToken && mainToken.length > 0) {
+    return new Response("Missing token parameter. Please use ?token=xxx", { 
+      status: 400,
+      headers: { "Content-Type": "text/plain; charset=utf-8" }
+    });
+  }
+  
+  // 情况3: 没有设置主 Token，公开访问
+  return handleMainSub(request, env, url);
 }
 
 async function handleMainSub(request, env, url) {
@@ -353,8 +384,8 @@ function handleAdmin(origin) {
     ".sublist-container{display:flex;flex-direction:column;gap:12px;margin-top:8px}",
     ".sub-item{background:var(--bg);border:1px solid var(--bor);border-radius:8px;padding:12px}",
     ".sub-item-header{display:flex;gap:10px;align-items:center;margin-bottom:8px;flex-wrap:wrap}",
-    ".sub-item input[type=text]{flex:1;min-width:150px;background:transparent;border:1px solid var(--bor);border-radius:6px;color:var(--tx);padding:6px 10px;font-size:.85rem}",
-    ".sub-item .sub-token{color:var(--b);font-family:monospace;font-size:.78rem;padding:4px 8px;background:rgba(93,231,180,.08);border-radius:4px;word-break:break-all}",
+    ".sub-item .sub-name{flex:1;min-width:120px;background:transparent;border:1px solid var(--bor);border-radius:6px;color:var(--tx);padding:6px 10px;font-size:.85rem}",
+    ".sub-item .sub-token-input{flex:1;min-width:150px;background:transparent;border:1px solid var(--bor);border-radius:6px;color:var(--b);padding:6px 10px;font-size:.82rem;font-family:monospace}",
     ".sub-item .sub-actions{display:flex;gap:4px;flex-wrap:wrap}",
     ".sub-item .sub-actions button{background:transparent;border:none;color:var(--mu);cursor:pointer;padding:4px 8px;font-size:.8rem;border-radius:4px}",
     ".sub-item .sub-actions button:hover{background:var(--bor);color:var(--tx)}",
@@ -370,9 +401,11 @@ function handleAdmin(origin) {
     ".sub-url-box .sub-url{flex:1;font-family:monospace;font-size:.78rem;color:var(--b);word-break:break-all}",
     ".sub-url-box .copy-btn{background:transparent;border:none;color:var(--mu);cursor:pointer;font-size:.75rem;padding:2px 8px;border-radius:4px}",
     ".sub-url-box .copy-btn:hover{background:rgba(255,255,255,.05);color:var(--tx)}",
-    ".sub-item .sub-name{color:var(--tx);font-weight:500}",
-    ".regenerate-btn{color:var(--b) !important}",
-    ".regenerate-btn:hover{background:rgba(93,231,180,.1) !important}",
+    ".gen-token-btn{color:var(--b) !important}",
+    ".gen-token-btn:hover{background:rgba(93,231,180,.1) !important}",
+    ".warning-text{color:var(--warn);font-size:.75rem}",
+    ".status-ok{color:var(--b)}",
+    ".status-warn{color:var(--warn)}",
     "#toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#22253a;border:1px solid var(--bor);color:var(--tx);padding:10px 22px;border-radius:20px;font-size:.88rem;opacity:0;transition:opacity .25s;pointer-events:none;white-space:nowrap;z-index:999}",
     "#toast.on{opacity:1}"
   ].join("\n");
@@ -511,8 +544,18 @@ function handleAdmin(origin) {
     "  document.getElementById('sub-url-display').textContent=full;",
     "  document.getElementById('sub-url-full').value=full;",
     "  var badge=document.getElementById('token-badge');",
-    "  if(tok){badge.className='token-badge';badge.textContent='🔒 已启用 Token 保护';}",
-    "  else{badge.className='token-badge token-none';badge.textContent='🔓 未启用 Token（订阅链接公开可访问）';}",
+    "  var statusText=document.getElementById('sub-status');",
+    "  if(tok){",
+    "    badge.className='token-badge';",
+    "    badge.innerHTML='🔒 已设置主订阅 Token，访问需要携带 token';",
+    "    statusText.className='status-ok';",
+    "    statusText.textContent='需要 Token 访问';",
+    "  }else{",
+    "    badge.className='token-badge token-none';",
+    "    badge.innerHTML='🔓 未设置主订阅 Token，直接访问 /sub 即可';",
+    "    statusText.className='status-warn';",
+    "    statusText.textContent='公开访问';",
+    "  }",
     "}",
 
     "function getNodeLabels(){",
@@ -571,7 +614,7 @@ function handleAdmin(origin) {
     "  }",
     "}",
 
-    "function genToken(length){",
+    "function genRandomToken(length){",
     "  var chars='ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678';",
     "  var t='';for(var i=0;i<length;i++)t+=chars[Math.floor(Math.random()*chars.length)];",
     "  return t;",
@@ -593,15 +636,14 @@ function handleAdmin(origin) {
     "      +'<label><span class=\"node-idx\">#'+(i+1)+'</span>'+escapeHtml(labels[i]||'（空）')+'</label>'",
     "      +'</div>';",
     "  }",
-    "  var subId=div.dataset.id;",
-    "  var subToken=token||genToken(24);",
+    "  var subToken=token||genRandomToken(24);",
     "  var baseUrl='" + subUrl + "';",
     "  var fullUrl=baseUrl+'?token='+subToken;",
     "  div.innerHTML='<div class=\"sub-item-header\">'",
-    "    +'<input type=\"text\" class=\"sub-name\" placeholder=\"订阅名称\" value=\"'+escapeHtml(name||'')+'\">'",
-    "    +'<span class=\"sub-token\">'+subToken+'</span>'",
+    "    +'<input class=\"sub-name\" type=\"text\" placeholder=\"订阅名称\" value=\"'+escapeHtml(name||'')+'\">'",
+    "    +'<input class=\"sub-token-input\" type=\"text\" placeholder=\"Token（自定义）\" value=\"'+subToken+'\" oninput=\"updateSubUrlFromInput(this)\">'",
     "    +'<div class=\"sub-actions\">'",
-    "    +'<button onclick=\"regenerateToken(this)\" class=\"regenerate-btn\" title=\"重新生成 Token\">⟳</button>'",
+    "    +'<button onclick=\"genTokenForSub(this)\" class=\"gen-token-btn\" title=\"生成随机 Token\">🎲</button>'",
     "    +'<button onclick=\"deleteSub(this)\" class=\"del\" title=\"删除\">✕</button>'",
     "    +'</div>'",
     "    +'</div>'",
@@ -613,51 +655,74 @@ function handleAdmin(origin) {
     "  container.appendChild(div);",
     "}",
 
+    "function updateSubUrlFromInput(input){",
+    "  var item=input.closest('.sub-item');",
+    "  var token=input.value.trim();",
+    "  var urlSpan=item.querySelector('.sub-url');",
+    "  var baseUrl='" + subUrl + "';",
+    "  if(token){",
+    "    urlSpan.textContent=baseUrl+'?token='+encodeURIComponent(token);",
+    "  }else{",
+    "    urlSpan.textContent='（请设置 Token）';",
+    "  }",
+    "}",
+
     "function deleteSub(btn){",
     "  var item=btn.closest('.sub-item');",
     "  if(item){item.remove();}",
     "}",
 
-    "function regenerateToken(btn){",
+    "function genTokenForSub(btn){",
     "  var item=btn.closest('.sub-item');",
-    "  var tokenSpan=item.querySelector('.sub-token');",
-    "  var newToken=genToken(24);",
-    "  tokenSpan.textContent=newToken;",
-    "  var urlSpan=item.querySelector('.sub-url');",
-    "  var baseUrl='" + subUrl + "';",
-    "  urlSpan.textContent=baseUrl+'?token='+newToken;",
+    "  var tokenInput=item.querySelector('.sub-token-input');",
+    "  var newToken=genRandomToken(24);",
+    "  tokenInput.value=newToken;",
+    "  updateSubUrlFromInput(tokenInput);",
     "  toast('Token 已重新生成 ✓');",
     "}",
 
     "function copySubUrl(btn){",
     "  var url=btn.closest('.sub-url-box').querySelector('.sub-url').textContent;",
+    "  if(!url || url==='（请设置 Token）'){toast('请先设置 Token',true);return;}",
     "  navigator.clipboard.writeText(url).then(function(){toast('已复制 ✓');});",
     "}",
 
     "function getSubListData(){",
     "  var subItems=document.querySelectorAll('.sub-item');",
     "  var data=[];",
+    "  var hasError=false;",
     "  subItems.forEach(function(item){",
     "    var id=item.dataset.id;",
     "    var name=item.querySelector('.sub-name').value.trim();",
-    "    var token=item.querySelector('.sub-token').textContent.trim();",
+    "    var token=item.querySelector('.sub-token-input').value.trim();",
+    "    if(!token){",
+    "      toast('订阅 \"'+(name||'未命名')+'\" 缺少 Token',true);",
+    "      hasError=true;",
+    "      return;",
+    "    }",
+    "    if(!name){",
+    "      toast('订阅缺少名称',true);",
+    "      hasError=true;",
+    "      return;",
+    "    }",
     "    var checkboxes=item.querySelectorAll('.node-select-grid input[type=checkbox]');",
     "    var selectedIndices=[];",
     "    checkboxes.forEach(function(cb){",
     "      if(cb.checked)selectedIndices.push(parseInt(cb.value));",
     "    });",
-    "    if(name){",
-    "      data.push({id:id,name:name,token:token,selectedIndices:selectedIndices});",
-    "    }",
+    "    data.push({id:id,name:name,token:token,selectedIndices:selectedIndices});",
     "  });",
+    "  if(hasError) return null;",
     "  return data;",
     "}",
 
     "async function saveSubList(){",
     "  var data=getSubListData();",
+    "  if(data===null) return;",
     "  try{",
-    "    await fetch('/api/savesublist',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sublist:data})});",
-    "    toast('订阅列表已保存 ✓');",
+    "    var r=await fetch('/api/savesublist',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sublist:data})});",
+    "    var d=await r.json();",
+    "    if(d.ok){toast('订阅列表已保存 ✓');}else{toast(d.error||'保存失败',true);}",
     "  }catch(e){toast('保存失败',true);}",
     "}",
 
@@ -773,7 +838,7 @@ function handleAdmin(origin) {
     "}",
 
     "function genGlobalToken(){",
-    "  document.getElementById('inp-token').value=genToken(24);",
+    "  document.getElementById('inp-token').value=genRandomToken(24);",
     "  updateSubUrl();",
     "}",
 
@@ -818,13 +883,16 @@ function handleAdmin(origin) {
     "  <div id=\"main\" style=\"display:none\">",
 
     "    <div class=\"card\">",
-    "      <div class=\"label\">主订阅地址（包含所有启用的节点）</div>",
+    "      <div class=\"label\">主订阅 <span style=\"color:var(--mu);font-weight:400;text-transform:none;font-size:.75rem\">（包含所有启用的节点）</span></div>",
     "      <div class=\"subbox\">",
     "        <div id=\"sub-url-display\" class=\"suburl\">" + subUrl + "</div>",
     "        <button class=\"btn pb sm\" onclick=\"copyUrl()\">复制</button>",
     "      </div>",
     "      <input type=\"hidden\" id=\"sub-url-full\" value=\"" + subUrl + "\">",
-    "      <div id=\"token-badge\" class=\"token-badge token-none\">🔓 未启用 Token（订阅链接公开可访问）</div>",
+    "      <div style=\"display:flex;align-items:center;gap:12px;margin-top:8px\">",
+    "        <div id=\"token-badge\" class=\"token-badge token-none\">🔓 未设置主订阅 Token，直接访问 /sub 即可</div>",
+    "        <span id=\"sub-status\" class=\"status-warn\">公开访问</span>",
+    "      </div>",
     "    </div>",
 
     "    <div class=\"card\">",
@@ -846,7 +914,7 @@ function handleAdmin(origin) {
     "          <input id=\"inp-subname\" type=\"text\" placeholder=\"例如：我的机场\">",
     "        </div>",
     "        <div class=\"field\">",
-    "          <label>全局访问 Token（留空则不启用保护）</label>",
+    "          <label>主订阅 Token <span class=\"warning-text\">（留空则公开访问 /sub）</span></label>",
     "          <div class=\"row\">",
     "            <input id=\"inp-token\" type=\"text\" placeholder=\"留空表示公开访问\">",
     "            <button class=\"btn pc sm\" id=\"gen-global-token\">随机</button>",
@@ -901,7 +969,11 @@ function handleAdmin(origin) {
     "      </div>",
     "    </div>",
 
-    "    <div class=\"tip\"><strong>说明：</strong>每个节点前面的开关控制是否在订阅中生成。http/https 开头的订阅链接会在输出时自动拉取并展开节点；vmess/vless/trojan/ss 等协议链接直接透传。自定义订阅通过 Token 区分，每个订阅可以自由选择要包含的节点。</div>",
+    "    <div class=\"tip\"><strong>访问规则：</strong><br>",
+    "    • <strong>未设置主 Token</strong>：访问 <code>/sub</code> 返回所有启用节点（公开）<br>",
+    "    • <strong>已设置主 Token</strong>：访问 <code>/sub</code> 会提示 <code>Missing token parameter</code>，必须使用 <code>/sub?token=主Token</code><br>",
+    "    • <strong>自定义订阅</strong>：始终需要 Token 访问，格式为 <code>/sub?token=自定义Token</code><br>",
+    "    • <strong>Token 冲突</strong>：主 Token 和自定义 Token 不能相同</div>",
     "  </div>",
     "</div>",
     "<div id=\"toast\"></div>",
